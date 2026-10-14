@@ -18,6 +18,8 @@ an equivalent :class:`._EventKey`.
 from __future__ import annotations
 
 import collections
+import logging
+import threading
 import types
 import typing
 from typing import Any
@@ -27,6 +29,7 @@ from typing import Deque
 from typing import Dict
 from typing import Generic
 from typing import Iterable
+from typing import NamedTuple
 from typing import Optional
 from typing import Tuple
 from typing import TypeVar
@@ -43,6 +46,173 @@ if typing.TYPE_CHECKING:
 _ListenerFnType = Callable[..., Any]
 _ListenerFnKeyType = Union[int, Tuple[int, int]]
 _EventKeyTupleType = Tuple[int, str, _ListenerFnKeyType]
+
+_log = logging.getLogger("sqlalchemy.event")
+
+#: failure policy: propagate the exception and stop the chain (the
+#: historical behavior, and the default).
+FAILURE_RAISE = "raise"
+
+#: failure policy: catch the listener exception, record it, and continue
+#: dispatching to subsequent listeners.
+FAILURE_SKIP = "skip"
+
+#: failure policy: like :data:`FAILURE_SKIP`, but also log a warning with
+#: the listener exception.
+FAILURE_LOG = "log"
+
+_FAILURE_POLICIES = frozenset({FAILURE_RAISE, FAILURE_SKIP, FAILURE_LOG})
+
+#: maximum number of failure records retained per listener.  the cumulative
+#: failure count is tracked separately and is never truncated.
+_FAILURE_RECORD_LIMIT = 100
+
+
+class ListenerFailure(NamedTuple):
+    """A single recorded failure of an event listener.
+
+    .. versionadded:: 2.1.5
+
+    """
+
+    event: str
+    """name of the event that was being dispatched."""
+
+    listener: str
+    """identifier of the listener that raised, e.g. its qualified name."""
+
+    error: str
+    """summary of the exception, of the form ``"ExceptionType: message"``."""
+
+
+def _listener_label(fn: _ListenerFnType) -> str:
+    module = getattr(fn, "__module__", None)
+    qualname = getattr(fn, "__qualname__", None)
+    if module is not None and qualname is not None:
+        return f"{module}.{qualname}"
+    return repr(fn)
+
+
+class _ListenerState:
+    """Registration-time metadata and failure bookkeeping for one logical
+    listener registration, shared across every collection the listener
+    fans out into (e.g. via class-level propagation)."""
+
+    __slots__ = (
+        "identifier",
+        "fn",
+        "fn_name",
+        "on_failure",
+        "fail_count",
+        "failures",
+        "_lock",
+    )
+
+    identifier: str
+    fn: _ListenerFnType
+    fn_name: str
+    on_failure: str
+    fail_count: int
+    failures: Deque[ListenerFailure]
+    _lock: threading.Lock
+
+    def __init__(self, event_key: "_EventKey[Any]", on_failure: str) -> None:
+        self.identifier = event_key.identifier
+        self.fn = event_key.fn
+        self.fn_name = _listener_label(event_key.fn)
+        self.on_failure = on_failure
+        self.fail_count = 0
+        self.failures = collections.deque(maxlen=_FAILURE_RECORD_LIMIT)
+        self._lock = threading.Lock()
+
+    def record_failure(self, error: BaseException) -> ListenerFailure:
+        record = ListenerFailure(
+            self.identifier,
+            self.fn_name,
+            f"{type(error).__name__}: {error}",
+        )
+        # dispatch may happen concurrently from multiple threads; the count
+        # and the retained record set must be updated atomically.
+        with self._lock:
+            self.fail_count += 1
+            self.failures.append(record)
+        return record
+
+    def snapshot(self) -> Tuple[int, Tuple[ListenerFailure, ...]]:
+        with self._lock:
+            return self.fail_count, tuple(self.failures)
+
+    def wrap(self, fn: _ListenerFnType) -> _ListenerFnType:
+        """Return a version of ``fn`` that applies this listener's failure
+        policy."""
+
+        state = self
+        if state.on_failure == FAILURE_LOG:
+
+            def _go(*arg: Any, **kw: Any) -> Any:
+                try:
+                    return fn(*arg, **kw)
+                except Exception as err:  # noqa: BLE001
+                    record = state.record_failure(err)
+                    _log.warning(
+                        "Listener %r for event %r raised %s; the listener "
+                        "was skipped and event dispatch continued",
+                        record.listener,
+                        record.event,
+                        record.error,
+                        exc_info=err,
+                    )
+                    return None
+
+        else:
+            # FAILURE_SKIP
+            def _go(*arg: Any, **kw: Any) -> Any:
+                try:
+                    return fn(*arg, **kw)
+                except Exception as err:  # noqa: BLE001
+                    state.record_failure(err)
+                    return None
+
+        return _go
+
+
+_key_to_state: Dict[_EventKeyTupleType, _ListenerState] = {}
+"""
+Maps the same logical-registration key used by ``_key_to_collection``
+to the :class:`_ListenerState` holding registration metadata and
+failure bookkeeping.
+"""
+
+
+def _register_listener_state(
+    event_key: "_EventKey[Any]", on_failure: str
+) -> _ListenerState:
+    key = event_key._key
+
+    # registration is a configurational operation, but two registrations
+    # may still race each other under free-threaded builds.
+    with util.mini_gil:
+        state = _key_to_state.get(key)
+        if state is None:
+            state = _ListenerState(event_key, on_failure)
+            _key_to_state[key] = state
+    return state
+
+
+def _discard_listener_state(key: _EventKeyTupleType) -> None:
+    _key_to_state.pop(key, None)
+
+
+def _state_for_stored_fn(
+    owner: "RefCollection[Any]", listen_fn: _ListenerFnType
+) -> Optional[_ListenerState]:
+    listener_to_key = _collection_to_key.get(owner.ref)
+    if not listener_to_key:
+        return None
+    key = listener_to_key.get(weakref.ref(listen_fn))
+    if key is None:
+        return None
+    return _key_to_state.get(key)
 
 
 _ET = TypeVar("_ET", bound="EventTarget")
@@ -116,6 +286,7 @@ def _collection_gced(ref: weakref.ref[Any]) -> None:
             dispatch_reg.pop(ref)
             if not dispatch_reg:
                 _key_to_collection.pop(key)
+                _discard_listener_state(key)
 
 
 def _stored_in_collection(
@@ -152,6 +323,7 @@ def _removed_from_collection(
     dispatch_reg.pop(owner_ref, None)
     if not dispatch_reg:
         del _key_to_collection[key]
+        _discard_listener_state(key)
 
     if owner_ref in _collection_to_key:
         listener_to_key = _collection_to_key[owner_ref]
@@ -215,6 +387,7 @@ def _clear(
 
         if not dispatch_reg:
             del _key_to_collection[key]
+            _discard_listener_state(key)
 
 
 class _EventKey(Generic[_ET]):
@@ -286,6 +459,13 @@ class _EventKey(Generic[_ET]):
         once = kw.pop("once", False)
         once_unless_exception = kw.pop("_once_unless_exception", False)
         named = kw.pop("named", False)
+        on_failure = kw.pop("on_failure", FAILURE_RAISE)
+
+        if on_failure not in _FAILURE_POLICIES:
+            raise exc.ArgumentError(
+                "Unknown failure policy %r for event listener; expected "
+                "one of: 'raise', 'skip', 'log'" % (on_failure,)
+            )
 
         target, identifier, fn = (
             self.dispatch_target,
@@ -299,6 +479,10 @@ class _EventKey(Generic[_ET]):
 
         self = self.with_wrapper(adjusted_fn)
 
+        state = _register_listener_state(self, on_failure)
+        if on_failure != FAILURE_RAISE:
+            self = self.with_wrapper(state.wrap(self._listen_fn))
+
         stub_function = getattr(
             self.dispatch_target.dispatch._events, self.identifier
         )
@@ -306,6 +490,9 @@ class _EventKey(Generic[_ET]):
             stub_function._sa_warn()
 
         if once or once_unless_exception:
+            # the recursive .listen() call reuses the already-registered
+            # listener state; the default on_failure lookup there is a
+            # no-op and must not wrap the function a second time.
             self.with_wrapper(
                 util.only_once(
                     self._listen_fn, retry_on_exception=once_unless_exception
@@ -324,6 +511,7 @@ class _EventKey(Generic[_ET]):
             )
 
         dispatch_reg = _key_to_collection.pop(key)
+        _discard_listener_state(key)
 
         for collection_ref, listener_ref in dispatch_reg.items():
             collection = collection_ref()

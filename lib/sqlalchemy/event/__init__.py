@@ -10,8 +10,12 @@ from __future__ import annotations
 from .api import CANCEL as CANCEL
 from .api import contains as contains
 from .api import listen as listen
+from .api import listener_failures as listener_failures
+from .api import ListenerEntry as ListenerEntry
+from .api import ListenerRegistryView as ListenerRegistryView
 from .api import listens_for as listens_for
 from .api import NO_RETVAL as NO_RETVAL
+from .api import registered_listeners as registered_listeners
 from .api import remove as remove
 from .attr import _InstanceLevelDispatch as _InstanceLevelDispatch
 from .attr import RefCollection as RefCollection
@@ -24,3 +28,7 @@ from .legacy import _omit_standard_example as _omit_standard_example
 from .registry import _EventKey as _EventKey
 from .registry import _ListenerFnType as _ListenerFnType
 from .registry import EventTarget as EventTarget
+from .registry import FAILURE_LOG as FAILURE_LOG
+from .registry import FAILURE_RAISE as FAILURE_RAISE
+from .registry import FAILURE_SKIP as FAILURE_SKIP
+from .registry import ListenerFailure as ListenerFailure

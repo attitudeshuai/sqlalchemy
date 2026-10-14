@@ -1,5 +1,6 @@
 """Test event registration and listening."""
 
+import logging
 from unittest.mock import call
 from unittest.mock import Mock
 
@@ -1792,3 +1793,465 @@ class RemovalTest(TearDownLocalEventsFixture, fixtures.TestBase):
         t1.dispatch.event_one("t2")
 
         eq_(listen_one.mock_calls, [call("adapted t1")])
+
+
+class _EventListenerLogHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def __enter__(self):
+        logger = logging.getLogger("sqlalchemy.event")
+        self._old_level = logger.level
+        logger.addHandler(self)
+        logger.setLevel(logging.WARNING)
+        return self
+
+    def __exit__(self, *arg):
+        logger = logging.getLogger("sqlalchemy.event")
+        logger.removeHandler(self)
+        logger.setLevel(self._old_level)
+
+
+class FailurePolicyTest(TearDownLocalEventsFixture, fixtures.TestBase):
+    """test listener failure isolation policies"""
+
+    def setup_test(self):
+        class TargetEvents(event.Events):
+            def event_one(self, x, y):
+                pass
+
+            def event_two(self, x):
+                pass
+
+        class Target:
+            dispatch = event.dispatcher(TargetEvents)
+
+        self.Target = Target
+
+    def test_default_policy_raises_and_stops_chain(self):
+        canary_one = Mock()
+        canary_three = Mock()
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", canary_one)
+        event.listen(self.Target, "event_one", bad)
+        event.listen(self.Target, "event_one", canary_three)
+
+        t1 = self.Target()
+
+        assert_raises_message(ValueError, "boom", t1.dispatch.event_one, 1, 2)
+
+        # the listener after the raising one never ran
+        eq_(canary_one.mock_calls, [call(1, 2)])
+        eq_(canary_three.mock_calls, [])
+
+        # no failure bookkeeping leaks for the default policy
+        view = event.registered_listeners(self.Target)
+        for entry in view["event_one"]:
+            eq_(entry.on_failure, event.FAILURE_RAISE)
+            eq_(entry.fail_count, 0)
+            eq_(entry.failures, ())
+
+        eq_(event.listener_failures(self.Target), ())
+
+    def test_skip_policy_continues_and_records(self):
+        m1 = Mock()
+        m3 = Mock()
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", m1)
+        event.listen(
+            self.Target, "event_one", bad, on_failure=event.FAILURE_SKIP
+        )
+        event.listen(self.Target, "event_one", m3)
+
+        t1 = self.Target()
+        t1.dispatch.event_one(1, 2)
+        t1.dispatch.event_one(3, 4)
+
+        # every other listener ran on every dispatch
+        eq_(m1.mock_calls, [call(1, 2), call(3, 4)])
+        eq_(m3.mock_calls, [call(1, 2), call(3, 4)])
+
+        entries = event.registered_listeners(self.Target)["event_one"]
+        by_fn = {entry.listener: entry for entry in entries}
+
+        entry = by_fn[bad]
+        eq_(entry.on_failure, "skip")
+        eq_(entry.fail_count, 2)
+        eq_(len(entry.failures), 2)
+
+        record = entry.failures[0]
+        eq_(record.event, "event_one")
+        assert record.listener.endswith(".bad"), record.listener
+        eq_(record.error, "ValueError: boom")
+
+        eq_(
+            event.listener_failures(self.Target, "event_one"),
+            entry.failures,
+        )
+        eq_(event.listener_failures(self.Target, "event_two"), ())
+
+        assert_raises_message(
+            exc.InvalidRequestError,
+            "No such event 'no_such_event'",
+            event.listener_failures,
+            self.Target,
+            "no_such_event",
+        )
+
+    def test_log_policy_logs_warning_and_continues(self):
+        canary = Mock()
+
+        def bad(x, y):
+            raise RuntimeError("nope")
+
+        event.listen(
+            self.Target,
+            "event_one",
+            bad,
+            on_failure=event.FAILURE_LOG,
+        )
+        event.listen(self.Target, "event_one", canary)
+
+        t1 = self.Target()
+
+        with _EventListenerLogHandler() as handler:
+            t1.dispatch.event_one(1, 2)
+
+        eq_(canary.mock_calls, [call(1, 2)])
+        eq_(len(handler.records), 1)
+        message = handler.records[0].getMessage()
+        assert "bad" in message
+        assert "event_one" in message
+        assert "RuntimeError: nope" in message
+
+        entry = event.registered_listeners(self.Target)["event_one"][0]
+        eq_(entry.on_failure, "log")
+        eq_(entry.fail_count, 1)
+
+    def test_invalid_policy_raises(self):
+        assert_raises_message(
+            exc.ArgumentError,
+            "Unknown failure policy 'bogus'",
+            event.listen,
+            self.Target,
+            "event_one",
+            Mock(),
+            on_failure="bogus",
+        )
+
+    def test_default_listeners_are_not_wrapped(self):
+        fn = Mock()
+        event.listen(self.Target, "event_one", fn)
+
+        # exact historical storage: the function itself, no wrapper
+        eq_(list(self.Target().dispatch.event_one), [fn])
+
+    def test_args_and_return_value_passthrough(self):
+        seen = []
+
+        def good(x, y):
+            seen.append((x, y))
+            return "value"
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", good)
+        event.listen(self.Target, "event_one", bad, on_failure="skip")
+
+        t1 = self.Target()
+
+        # mimic a retval-style call site, e.g. AttributeEvents set
+        results = [fn("a", "b") for fn in t1.dispatch.event_one]
+
+        eq_(seen, [("a", "b")])
+        # successful listener returns its value untouched; skipped
+        # listener contributes None
+        eq_(results, ["value", None])
+
+    def test_skip_with_once(self):
+        m1 = Mock(side_effect=ValueError("boom"))
+
+        event.listen(
+            self.Target,
+            "event_one",
+            m1,
+            once=True,
+            on_failure="skip",
+        )
+
+        t1 = self.Target()
+        t1.dispatch.event_one(1, 2)
+        t1.dispatch.event_one(3, 4)
+
+        # the skip happened inside the once wrapper, so it ran exactly once
+        eq_(m1.mock_calls, [call(1, 2)])
+        entry = event.registered_listeners(self.Target)["event_one"][0]
+        eq_(entry.fail_count, 1)
+
+    def test_concurrent_failures_are_not_lost(self):
+        import threading
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", bad, on_failure="skip")
+
+        t1 = self.Target()
+
+        n_threads = 8
+        n_per_thread = 200
+        barrier = threading.Barrier(n_threads)
+
+        def worker():
+            barrier.wait()
+            for i in range(n_per_thread):
+                t1.dispatch.event_one(i, i)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        entry = event.registered_listeners(self.Target)["event_one"][0]
+        eq_(entry.fail_count, n_threads * n_per_thread)
+
+    def test_class_propagation_shares_failure_state(self):
+        class SubTarget(self.Target):
+            pass
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", bad, on_failure="skip")
+
+        sub = SubTarget()
+        sub.dispatch.event_one(1, 2)
+
+        entries = event.registered_listeners(SubTarget)["event_one"]
+        eq_([entry.listener for entry in entries], [bad])
+        eq_(entries[0].fail_count, 1)
+
+    def test_propagated_instance_listener_shares_state(self):
+        def bad(x, y):
+            raise ValueError("boom")
+
+        t1 = self.Target()
+        t2 = self.Target()
+
+        event.listen(t1, "event_one", bad, propagate=True, on_failure="skip")
+        t2.dispatch._update(t1.dispatch)
+
+        # dispatch propagation copies the stored wrapper and keeps it
+        # associated with the originating registration's failure state
+        entries = event.registered_listeners(t2)["event_one"]
+        eq_([entry.listener for entry in entries], [bad])
+        eq_(entries[0].on_failure, "skip")
+
+        t2.dispatch.event_one(1, 2)
+        t1.dispatch.event_one(3, 4)
+
+        eq_(event.registered_listeners(t1)["event_one"][0].fail_count, 2)
+        eq_(event.registered_listeners(t2)["event_one"][0].fail_count, 2)
+
+    @testing.requires.predictable_gc
+    def test_instance_state_cleaned_up_on_gc(self):
+        from sqlalchemy.event import registry
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        t1 = self.Target()
+        event.listen(t1, "event_one", bad, on_failure="skip")
+
+        key = (id(t1), "event_one", id(bad))
+        assert key in registry._key_to_state
+
+        del t1
+        gc_collect()
+
+        assert key not in registry._key_to_state
+
+    def test_remove_clears_failure_history(self):
+        from sqlalchemy.event import registry
+
+        def bad(x, y):
+            raise ValueError("boom")
+
+        event.listen(self.Target, "event_one", bad, on_failure="skip")
+
+        key = (id(self.Target), "event_one", id(bad))
+
+        self.Target().dispatch.event_one(1, 2)
+        eq_(
+            event.registered_listeners(self.Target)["event_one"][0].fail_count,
+            1,
+        )
+
+        event.remove(self.Target, "event_one", bad)
+
+        assert "event_one" not in event.registered_listeners(self.Target)
+        eq_(event.listener_failures(self.Target), ())
+        assert key not in registry._key_to_state
+
+        # re-registering starts with fresh bookkeeping
+        event.listen(self.Target, "event_one", bad, on_failure="skip")
+        entry = event.registered_listeners(self.Target)["event_one"][0]
+        eq_(entry.fail_count, 0)
+
+
+class RegisteredListenersViewTest(
+    TearDownLocalEventsFixture, fixtures.TestBase
+):
+    """test the read-only listener registry view"""
+
+    def setup_test(self):
+        class TargetEvents(event.Events):
+            def event_one(self, x, y):
+                pass
+
+            def event_two(self, x):
+                pass
+
+        class Target:
+            dispatch = event.dispatcher(TargetEvents)
+
+        self.Target = Target
+        self.TargetEvents = TargetEvents
+
+    def test_class_level_ordering_including_insert(self):
+        def listen_one(x, y):
+            pass
+
+        def listen_two(x, y):
+            pass
+
+        def listen_three(x, y):
+            pass
+
+        event.listen(self.Target, "event_one", listen_one)
+        event.listen(self.Target, "event_one", listen_two)
+        event.listen(self.Target, "event_one", listen_three, insert=True)
+
+        view = event.registered_listeners(self.Target)
+
+        eq_(
+            [entry.listener for entry in view["event_one"]],
+            [listen_three, listen_one, listen_two],
+        )
+        eq_(
+            [entry.event for entry in view["event_one"]],
+            ["event_one", "event_one", "event_one"],
+        )
+        # events without listeners are omitted from the view
+        eq_(list(view), ["event_one"])
+
+    def test_instance_view_includes_class_then_instance(self):
+        def cls_listener(x, y):
+            pass
+
+        def inst_listener(x, y):
+            pass
+
+        event.listen(self.Target, "event_one", cls_listener)
+
+        t1 = self.Target()
+        event.listen(t1, "event_one", inst_listener, on_failure="log")
+
+        entries = event.registered_listeners(t1)["event_one"]
+        eq_(
+            [entry.listener for entry in entries],
+            [cls_listener, inst_listener],
+        )
+        eq_(entries[0].on_failure, "raise")
+        eq_(entries[1].on_failure, "log")
+
+        # instance listeners do not appear on other instances
+        other = self.Target()
+        other_entries = event.registered_listeners(other)["event_one"]
+        eq_([entry.listener for entry in other_entries], [cls_listener])
+
+    def test_view_is_read_only(self):
+        fn = Mock()
+        event.listen(self.Target, "event_one", fn)
+
+        view = event.registered_listeners(self.Target)
+
+        def assign():
+            view["event_one"] = ()
+
+        def delete():
+            del view["event_one"]
+
+        def mutate_entries():
+            view["event_one"][0] = None
+
+        assert_raises(TypeError, assign)
+        assert_raises(TypeError, delete)
+        assert_raises(TypeError, mutate_entries)
+
+    def test_joined_dispatch_view(self):
+        class BaseTarget:
+            dispatch = event.dispatcher(self.TargetEvents)
+
+        class SubTarget(BaseTarget):
+            _sa_propagate_class_events = False
+
+            def __init__(self, parent):
+                self.dispatch = self.dispatch._join(parent.dispatch)
+
+        def parent_listener(x, y):
+            pass
+
+        parent = BaseTarget()
+        event.listen(parent, "event_one", parent_listener, on_failure="skip")
+
+        child = SubTarget(parent)
+
+        entries = event.registered_listeners(child)["event_one"]
+        eq_([entry.listener for entry in entries], [parent_listener])
+        eq_(entries[0].on_failure, "skip")
+
+    def test_engine_connection_joined_view(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy import text
+
+        engine = create_engine("sqlite://")
+
+        def bad_before_cursor(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            raise RuntimeError("boom")
+
+        try:
+            event.listen(
+                engine,
+                "before_cursor_execute",
+                bad_before_cursor,
+                on_failure="skip",
+            )
+
+            with engine.connect() as conn:
+                # the failing listener does not stop statement execution
+                conn.execute(text("select 1"))
+
+                entries = event.registered_listeners(conn)[
+                    "before_cursor_execute"
+                ]
+                eq_([entry.listener for entry in entries], [bad_before_cursor])
+                eq_(entries[0].fail_count, 1)
+                eq_(entries[0].failures[0].error, "RuntimeError: boom")
+        finally:
+            event.remove(engine, "before_cursor_execute", bad_before_cursor)
+            engine.dispose()
