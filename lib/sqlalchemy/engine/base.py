@@ -1817,6 +1817,15 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         if self._transaction is None:
             self._autobegin()
 
+        if (
+            context.execution_options.get("bookmark") is not None
+            and context.executemany
+        ):
+            raise exc.ResultBookmarkError(
+                "Result bookmarks can only resume single-statement "
+                "executions, not executemany()."
+            )
+
         context.pre_exec()
 
         if context.execute_style is ExecuteStyle.INSERTMANYVALUES:
@@ -1965,6 +1974,16 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self._handle_dbapi_exception(
                 e, str_statement, effective_parameters, cursor, context
             )
+
+        pending_bookmark = context.execution_options.get("bookmark")
+        if pending_bookmark is not None:
+            try:
+                result._resume_from_bookmark(pending_bookmark)
+            except BaseException:
+                # release the cursor of the rejected result before
+                # propagating the bookmark failure
+                result.close()
+                raise
 
         return result
 

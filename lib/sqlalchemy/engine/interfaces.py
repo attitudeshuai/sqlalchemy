@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .base import Connection
     from .base import Engine
     from .cursor import CursorResult
+    from .result import ResultBookmark
     from .url import URL
     from ..connectors.asyncio import AsyncIODBAPIConnection
     from ..event import _ListenerFnType
@@ -293,6 +294,8 @@ class _CoreKnownExecutionOptions(TypedDict, total=False):
     schema_translate_map: Optional[SchemaTranslateMapType]
     preserve_rowcount: bool
     driver_column_names: bool
+    bookmark_tracking: bool
+    bookmark: "ResultBookmark"
 
 
 _ExecuteOptions = immutabledict[str, Any]

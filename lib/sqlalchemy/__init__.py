@@ -34,6 +34,7 @@ from .engine import MappingResult as MappingResult
 from .engine import MergedResult as MergedResult
 from .engine import NestedTransaction as NestedTransaction
 from .engine import Result as Result
+from .engine import ResultBookmark as ResultBookmark
 from .engine import result_tuple as result_tuple
 from .engine import ResultProxy as ResultProxy
 from .engine import RootTransaction as RootTransaction

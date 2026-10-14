@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import collections
+import hashlib
 import operator
 import typing
 from typing import Any
@@ -34,6 +35,7 @@ from typing import Union
 from .result import IteratorResult
 from .result import MergedResult
 from .result import Result
+from .result import ResultBookmark
 from .result import ResultMetaData
 from .result import SimpleResultMetaData
 from .result import tuplegetter
@@ -1555,6 +1557,172 @@ class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
         return ret
 
 
+# result set bookmark support ---------------------------------------------
+
+_BOOKMARK_SEEK_CHUNKSIZE = 1000
+
+
+def _length_prefixed(*parts: str) -> str:
+    return "".join("%d:%s" % (len(part), part) for part in parts)
+
+
+def _normalize_bookmark_params(params: Any) -> str:
+    """Render the DBAPI-level bound parameters into a stable, self
+    delimiting text form for fingerprinting."""
+
+    if isinstance(params, Mapping):
+        # sorted keys plus length-prefixed segments make this
+        # collision-free for any parameter values
+        body = "".join(
+            _length_prefixed("%s\x1f%r" % (key, params[key]))
+            for key in sorted(params)
+        )
+        return "m" + body
+    elif isinstance(params, (list, tuple)):
+        body = "".join(
+            _length_prefixed("%r" % (value,)) for value in params
+        )
+        return "p" + body
+    else:
+        return "r" + _length_prefixed(repr(params))
+
+
+def _bookmark_engine_identity(context: ExecutionContext) -> str:
+    return context.root_connection.engine.url.render_as_string(
+        hide_password=True
+    )
+
+
+def _bookmark_statement_fingerprint(
+    context: ExecutionContext, column_names: Sequence[str]
+) -> str:
+    payload = _length_prefixed(
+        context.dialect.name,
+        context.dialect.paramstyle,
+        context.statement or "",
+        "\x1f".join(column_names),
+    )
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def _bookmark_parameters_fingerprint(context: ExecutionContext) -> str:
+    if context.executemany or not context.parameters:
+        normalized = ""
+    else:
+        normalized = _normalize_bookmark_params(context.parameters[0])
+    payload = _length_prefixed(context.dialect.paramstyle, normalized)
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+class _BookmarkTrackingFetchStrategy(ResultFetchStrategy):
+    """Wrap a :class:`.ResultFetchStrategy` to count every row handed
+    out to the caller.
+
+    The wrapper is installed only when bookmark support is requested
+    through execution options, so ordinary result fetching keeps its
+    original strategy and pays no per-row cost.  It counts consumed
+    (rather than DBAPI-fetched) rows, which means rows sitting inside a
+    buffering strategy's pre-fetch buffer are not counted until they
+    are actually read.
+
+    """
+
+    __slots__ = ("_delegate", "rows_consumed", "column_names")
+
+    _delegate: ResultFetchStrategy
+    rows_consumed: int
+    column_names: Tuple[str, ...]
+
+    def __init__(
+        self,
+        delegate: ResultFetchStrategy,
+        cursor_description: _DBAPICursorDescription,
+    ):
+        self._delegate = delegate
+        self.rows_consumed = 0
+        # raw cursor column names, captured independently of client side
+        # metadata slicing such as Result.columns(), for fingerprinting
+        self.column_names = tuple(
+            entry[0] for entry in cursor_description
+        )
+
+    @property
+    def alternate_cursor_description(
+        self,
+    ) -> Optional[_DBAPICursorDescription]:
+        return self._delegate.alternate_cursor_description
+
+    def soft_close(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: Optional[DBAPICursor],
+    ) -> None:
+        self._delegate.soft_close(result, dbapi_cursor)
+        # the delegate replaces the result's strategy with the closed
+        # sentinel; keep this wrapper in place as the facade so that a
+        # terminal bookmark can still report the consumed row count
+        self._delegate = result.cursor_strategy
+        result.cursor_strategy = self
+
+    def hard_close(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: Optional[DBAPICursor],
+    ) -> None:
+        self._delegate.hard_close(result, dbapi_cursor)
+        self._delegate = result.cursor_strategy
+        result.cursor_strategy = self
+
+    def handle_exception(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: Optional[DBAPICursor],
+        err: BaseException,
+    ) -> NoReturn:
+        return self._delegate.handle_exception(result, dbapi_cursor, err)
+
+    def yield_per(
+        self, result: CursorResult[Any], dbapi_cursor: DBAPICursor, num: int
+    ) -> None:
+        self._delegate.yield_per(result, dbapi_cursor, num)
+        new_strategy = result.cursor_strategy
+        if new_strategy is not self:
+            # the delegate installed a new buffering strategy; wrap that
+            # one while keeping the consumed row counter
+            self._delegate = new_strategy
+            result.cursor_strategy = self
+
+    def fetchone(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: DBAPICursor,
+        hard_close: bool = False,
+    ) -> Any:
+        row = self._delegate.fetchone(result, dbapi_cursor, hard_close)
+        if row is not None:
+            self.rows_consumed += 1
+        return row
+
+    def fetchmany(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: DBAPICursor,
+        size: Optional[int] = None,
+    ) -> Any:
+        rows = self._delegate.fetchmany(result, dbapi_cursor, size)
+        if rows:
+            self.rows_consumed += len(rows)
+        return rows
+
+    def fetchall(
+        self, result: CursorResult[Any], dbapi_cursor: DBAPICursor
+    ) -> Any:
+        rows = self._delegate.fetchall(result, dbapi_cursor)
+        if rows:
+            self.rows_consumed += len(rows)
+        return rows
+
+
 class _NoResultMetaData(ResultMetaData):
     __slots__ = ()
 
@@ -1653,11 +1821,28 @@ class CursorResult(Result[Unpack[_Ts]]):
         self.context = context
         self.dialect = context.dialect
         self.cursor = context.cursor
-        self.cursor_strategy = cursor_strategy
         self.connection = context.root_connection
         self._echo = echo = (
             self.connection._echo and context.engine._should_log_debug()
         )
+
+        execution_options = context.execution_options
+        if (
+            cursor_description is not None
+            and not context.executemany
+            and (
+                execution_options.get("bookmark_tracking", False)
+                or execution_options.get("bookmark") is not None
+            )
+        ):
+            # count consumed rows for Result.bookmark() / resumption.
+            # installed only upon request so ordinary result reads
+            # retain their original fetch strategy with zero overhead.
+            cursor_strategy = _BookmarkTrackingFetchStrategy(
+                cursor_strategy, cursor_description
+            )
+
+        self.cursor_strategy = cursor_strategy
 
         if cursor_description is not None:
             self._init_metadata(context, cursor_description)
@@ -2420,6 +2605,122 @@ class CursorResult(Result[Unpack[_Ts]]):
         self._yield_per = num
         self.cursor_strategy.yield_per(self, self.cursor, num)
         return self
+
+    def _check_bookmark_supported(self) -> None:
+        if not self._metadata.returns_rows:
+            raise exc.ResultBookmarkError(
+                "Can't use result bookmarks with a result that does not "
+                "return rows."
+            )
+        if self.context.executemany:
+            raise exc.ResultBookmarkError(
+                "Result bookmarks are not supported for executemany() "
+                "executions."
+            )
+        if self._unique_filter_state is not None:
+            raise exc.ResultBookmarkError(
+                "Result bookmarks cannot be combined with the unique() "
+                "row filter, as the deduplication state can't be "
+                "reconstructed when resuming."
+            )
+
+    def bookmark(self) -> ResultBookmark:
+        """Return an opaque, serializable
+        :class:`_engine.ResultBookmark` for the current read position.
+
+        The result must have been executed with the
+        :paramref:`_engine.Connection.execution_options.bookmark_tracking`
+        execution option enabled.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :class:`_engine.ResultBookmark`
+
+        """
+        if self.closed:
+            raise exc.ResourceClosedError(
+                "Can't create a result bookmark from a result that has "
+                "been closed."
+            )
+
+        self._check_bookmark_supported()
+
+        strategy = self.cursor_strategy
+        if not isinstance(strategy, _BookmarkTrackingFetchStrategy):
+            raise exc.ResultBookmarkError(
+                "This result was not executed with bookmark tracking "
+                "enabled.  Re-execute the statement with "
+                "execution_options={'bookmark_tracking': True} in order "
+                "to obtain bookmarks."
+            )
+
+        context = self.context
+        return ResultBookmark._make(
+            engine_identity=_bookmark_engine_identity(context),
+            statement_fingerprint=_bookmark_statement_fingerprint(
+                context, strategy.column_names
+            ),
+            parameters_fingerprint=_bookmark_parameters_fingerprint(context),
+            consumed_rows=strategy.rows_consumed,
+            exhausted=self._soft_closed,
+        )
+
+    def _resume_from_bookmark(self, bookmark: ResultBookmark) -> None:
+        """Validate ``bookmark`` against this freshly executed result
+        and fast-forward it to the bookmarked row position."""
+
+        if not isinstance(bookmark, ResultBookmark):
+            raise exc.ResultBookmarkError(
+                "The 'bookmark' execution option must be a ResultBookmark "
+                "instance; got %r." % (bookmark,)
+            )
+
+        self._check_bookmark_supported()
+
+        # re-validate in case the bookmark was tampered with after
+        # deserialization
+        data = ResultBookmark._validate_payload(dict(bookmark._data))
+        context = self.context
+        strategy = self.cursor_strategy
+        assert isinstance(strategy, _BookmarkTrackingFetchStrategy)
+
+        if data["e"] != _bookmark_engine_identity(context):
+            raise exc.ResultBookmarkError(
+                "Result bookmark was created against a different engine "
+                "(database URL) and can't be used on this connection."
+            )
+
+        if data["s"] != _bookmark_statement_fingerprint(
+            context, strategy.column_names
+        ):
+            raise exc.ResultBookmarkError(
+                "Result bookmark does not match the statement being "
+                "executed (statement text or result columns differ).  "
+                "Re-execute the exact same statement in order to resume "
+                "from a bookmark."
+            )
+
+        if data["p"] != _bookmark_parameters_fingerprint(context):
+            raise exc.ResultBookmarkError(
+                "Result bookmark does not match the bound parameters of "
+                "the statement being executed.  Re-execute with the same "
+                "parameters in order to resume from a bookmark."
+            )
+
+        remaining = data["n"]
+        if remaining:
+            fetchmany = self._fetchmany_impl
+            while remaining:
+                rows = fetchmany(
+                    min(remaining, _BOOKMARK_SEEK_CHUNKSIZE)
+                )
+                if not rows:
+                    # the re-executed result produced fewer rows than
+                    # the bookmarked one; position at end of stream
+                    break
+                remaining -= len(rows)
 
 
 ResultProxy = CursorResult

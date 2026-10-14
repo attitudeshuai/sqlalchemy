@@ -12,11 +12,13 @@ from __future__ import annotations
 import functools
 import itertools
 import operator
+import pickle
 import typing
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Dict
+from typing import Final
 from typing import Generic
 from typing import Iterable
 from typing import Iterator
@@ -1168,6 +1170,76 @@ class Result(_WithKeys, ResultInternal[Row[Unpack[_Ts]]]):
 
         return FrozenResult(self)
 
+    def bookmark(self) -> ResultBookmark:
+        """Return an opaque, serializable bookmark for this result's
+        current read position.
+
+        The bookmark records a fingerprint of the executed statement and
+        parameters together with the number of rows consumed so far.
+        It can be passed to a subsequent execution of the **same**
+        statement with the **same** parameters, on the same engine, via
+        the :paramref:`_engine.Connection.execution_options.bookmark`
+        execution option, in order to resume reading where this result
+        left off::
+
+            result = connection.execute(
+                stmt,
+                execution_options={"bookmark_tracking": True},
+            )
+
+            for row in result:
+                if should_pause(row):
+                    bookmark = result.bookmark()
+                    break
+
+            # later - including in a different process - serialize the
+            # bookmark and resume from the breakpoint:
+            token = bookmark.dumps()
+
+            # ...
+
+            bookmark = ResultBookmark.loads(token)
+            result = connection.execute(
+                stmt,
+                execution_options={"bookmark": bookmark},
+            )
+            for row in result:  # starts after the previously read rows
+                ...
+
+        Bookmark tracking has to be enabled when the statement is
+        executed, using the
+        :paramref:`_engine.Connection.execution_options.bookmark_tracking`
+        execution option; results that do not enable tracking do not pay
+        any additional per-row overhead and raise
+        :class:`.ResultBookmarkError` when :meth:`_engine.Result.bookmark`
+        is called.
+
+        A result that has been fully consumed returns a *terminal*
+        bookmark; resuming from it yields an empty result.  Calling this
+        method on a result that was explicitly closed with
+        :meth:`_engine.Result.close` raises
+        :class:`.ResourceClosedError`.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :class:`_engine.ResultBookmark`
+
+            :paramref:`_engine.Connection.execution_options.bookmark_tracking`
+
+            :paramref:`_engine.Connection.execution_options.bookmark`
+
+        """
+        raise exc.ResultBookmarkError(
+            "Result bookmarks are only supported by a live, cursor-based "
+            "result that was executed with bookmark tracking enabled.  "
+            "Execute the statement with "
+            "execution_options={'bookmark_tracking': True} using "
+            "Connection.execute(); in-memory, frozen, merged and ORM "
+            "object-loading results do not support bookmarks."
+        )
+
     def merge(
         self, *others: Result[Unpack[TupleAny]]
     ) -> MergedResult[Unpack[TupleAny]]:
@@ -1264,6 +1336,27 @@ class FilterResult(ResultInternal[_R]):
 
         """
         self._real_result.close()
+
+    def bookmark(self) -> ResultBookmark:
+        """Return a bookmark for the current read position.
+
+        This is a pass through to the underlying cursor result; see
+        :meth:`_engine.Result.bookmark` for the full semantics.  The
+        bookmark tracks raw rows consumed from the cursor, so the same
+        filtering (e.g. :meth:`_engine.Result.scalars` or
+        :meth:`_engine.Result.mappings`) should be applied again after
+        resuming.
+
+        .. versionadded:: 2.1
+
+        """
+        if self._unique_filter_state is not None:
+            raise exc.ResultBookmarkError(
+                "Result bookmarks cannot be combined with the "
+                "unique() row filter, as the deduplication state can't "
+                "be reconstructed when resuming."
+            )
+        return self._real_result.bookmark()
 
     @property
     def _attributes(self) -> Dict[Any, Any]:
@@ -1726,6 +1819,202 @@ class MappingResult(_WithKeys, FilterResult[RowMapping]):
         return self._only_one_row(
             raise_for_second_row=True, raise_for_none=True, scalar=False
         )
+
+
+class ResultBookmark:
+    """An opaque, serializable bookmark capturing the read position of
+    a streaming :class:`_engine.Result`.
+
+    Instances are produced by :meth:`_engine.Result.bookmark` and are
+    passed back to :meth:`_engine.Connection.execute` through the
+    :paramref:`_engine.Connection.execution_options.bookmark` execution
+    option in order to re-create the result at the position where the
+    bookmark was taken::
+
+        result = connection.execute(
+            stmt,
+            execution_options={"bookmark_tracking": True},
+        )
+
+        first_batch = result.fetchmany(100)
+        bookmark = result.bookmark()
+
+    A bookmark only carries fingerprints of the statement and
+    parameters, an identifier for the engine, and the number of rows
+    consumed.  It does not carry any row data.  When a bookmark is used
+    to resume reading, the statement is re-executed with the same
+    parameters and the already-consumed rows are skipped; if the
+    engine, statement form, parameters, or result shape do not match
+    those recorded by the bookmark, :class:`.ResultBookmarkError` is
+    raised rather than silently restarting from the beginning.
+
+    The :meth:`dumps` and :meth:`loads` methods (as well as plain
+    :mod:`pickle` support) allow a bookmark to be stored and restored
+    in a different process, as long as that process can connect to the
+    same database::
+
+        token = bookmark.dumps()
+
+        # ... in another process ...
+
+        bookmark = ResultBookmark.loads(token)
+        result = connection.execute(
+            stmt,
+            execution_options={"bookmark": bookmark},
+        )
+
+    Bookmarks are immutable; resuming from the same bookmark any number
+    of times, concurrently or otherwise, produces independent result
+    sets each starting from the same position.
+
+    Note that resuming replays the query from the top and skips rows by
+    position; the underlying result therefore needs to be read in a
+    deterministic order (e.g. with an explicit ``ORDER BY``) for the
+    continued rows to correspond to those that would have been read
+    originally.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :meth:`_engine.Result.bookmark`
+
+        :paramref:`_engine.Connection.execution_options.bookmark_tracking`
+
+        :paramref:`_engine.Connection.execution_options.bookmark`
+
+    """
+
+    __slots__ = ("_data",)
+
+    _FORMAT_VERSION: Final[int] = 1
+
+    _data: Dict[str, Any]
+
+    def __init__(self, data: Optional[Mapping[str, Any]] = None):
+        if data is None:
+            raise exc.ResultBookmarkError(
+                "ResultBookmark objects are created by Result.bookmark(); "
+                "use ResultBookmark.loads() to restore a serialized bookmark."
+            )
+        self._data = self._validate_payload(dict(data))
+
+    @classmethod
+    def _make(
+        cls,
+        *,
+        engine_identity: str,
+        statement_fingerprint: str,
+        parameters_fingerprint: str,
+        consumed_rows: int,
+        exhausted: bool,
+    ) -> ResultBookmark:
+        bookmark = cls.__new__(cls)
+        bookmark._data = cls._validate_payload(
+            {
+                "v": cls._FORMAT_VERSION,
+                "e": engine_identity,
+                "s": statement_fingerprint,
+                "p": parameters_fingerprint,
+                "n": consumed_rows,
+                "x": exhausted,
+            }
+        )
+        return bookmark
+
+    @classmethod
+    def _validate_payload(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            version = data["v"]
+            engine_identity = data["e"]
+            statement_fingerprint = data["s"]
+            parameters_fingerprint = data["p"]
+            consumed_rows = data["n"]
+            exhausted = data["x"]
+        except (KeyError, TypeError) as err:
+            raise exc.ResultBookmarkError(
+                "Malformed result bookmark: missing fields."
+            ) from err
+
+        if version != cls._FORMAT_VERSION:
+            raise exc.ResultBookmarkError(
+                "Unsupported result bookmark format version %r; this "
+                "SQLAlchemy version supports version %r."
+                % (version, cls._FORMAT_VERSION)
+            )
+        if not isinstance(engine_identity, str) or not isinstance(
+            statement_fingerprint, str
+        ) or not isinstance(parameters_fingerprint, str):
+            raise exc.ResultBookmarkError(
+                "Malformed result bookmark: invalid fingerprint fields."
+            )
+        if isinstance(consumed_rows, bool) or not isinstance(
+            consumed_rows, int
+        ):
+            raise exc.ResultBookmarkError(
+                "Malformed result bookmark: invalid row position."
+            )
+        if consumed_rows < 0:
+            raise exc.ResultBookmarkError(
+                "Malformed result bookmark: negative row position."
+            )
+        if not isinstance(exhausted, bool):
+            raise exc.ResultBookmarkError(
+                "Malformed result bookmark: invalid exhaustion marker."
+            )
+        return data
+
+    @property
+    def consumed_rows(self) -> int:
+        """The number of rows consumed when the bookmark was taken."""
+        return self._data["n"]  # type: ignore[no-any-return]
+
+    @property
+    def exhausted(self) -> bool:
+        """``True`` if the result was fully consumed when the bookmark
+        was taken."""
+        return self._data["x"]
+
+    def dumps(self) -> bytes:
+        """Serialize the bookmark to a bytes token.
+
+        The token can later be restored with :meth:`loads`, including in
+        a different process.
+
+        """
+        return pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def loads(cls, data: bytes) -> ResultBookmark:
+        """Restore a bookmark previously produced by :meth:`dumps`."""
+        try:
+            obj = pickle.loads(data)
+        except Exception as err:
+            raise exc.ResultBookmarkError(
+                "Could not deserialize result bookmark."
+            ) from err
+        if not isinstance(obj, cls):
+            raise exc.ResultBookmarkError(
+                "Deserialized object is not a ResultBookmark."
+            )
+        return obj
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {"d": dict(self._data)}
+
+    def __setstate__(self, state: Mapping[str, Any]) -> None:
+        data = state.get("d") if isinstance(state, Mapping) else None
+        if not isinstance(data, Mapping):
+            raise exc.ResultBookmarkError(
+                "Malformed serialized result bookmark."
+            )
+        self._data = self._validate_payload(dict(data))
+
+    def __repr__(self) -> str:
+        state = "exhausted" if self._data["x"] else "at row %d" % (
+            self._data["n"],
+        )
+        return "<ResultBookmark (%s)>" % state
 
 
 class FrozenResult(Generic[Unpack[_Ts]]):

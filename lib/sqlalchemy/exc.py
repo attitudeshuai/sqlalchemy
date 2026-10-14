@@ -375,6 +375,25 @@ class ResourceClosedError(InvalidRequestError):
     object that's in a closed state."""
 
 
+class ResultBookmarkError(InvalidRequestError):
+    """An invalid operation was requested involving a result set
+    bookmark.
+
+    This is raised when:
+
+    * a bookmark is requested from a result that was not configured
+      for bookmark tracking, or that has been hard closed;
+    * a bookmark is used to resume a result against a different engine,
+      statement form, or set of parameters than the one that produced
+      the bookmark;
+    * a serialized bookmark is corrupt or uses an unsupported format
+      version.
+
+    .. versionadded:: 2.1
+
+    """
+
+
 class NoSuchColumnError(InvalidRequestError, KeyError):
     """A nonexistent column is requested from a ``Row``."""
 
