@@ -23,6 +23,13 @@ from .base import NestedTransaction as NestedTransaction
 from .base import RootTransaction as RootTransaction
 from .base import Transaction as Transaction
 from .base import TwoPhaseTransaction as TwoPhaseTransaction
+from .capabilities import CapabilityDeclaration as CapabilityDeclaration
+from .capabilities import CapabilityNegotiation as CapabilityNegotiation
+from .capabilities import CapabilityRecord as CapabilityRecord
+from .capabilities import CapabilityRegistry as CapabilityRegistry
+from .capabilities import CapabilityRule as CapabilityRule
+from .capabilities import CapabilitySource as CapabilitySource
+from .capabilities import CapabilityUndetermined as CapabilityUndetermined
 from .create import create_engine as create_engine
 from .create import create_pool_from_url as create_pool_from_url
 from .create import engine_from_config as engine_from_config

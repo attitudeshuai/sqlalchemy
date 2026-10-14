@@ -767,6 +767,38 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
             pool, "connect", first_connect, _once_unless_exception=True
         )
 
+        def capability_connect(
+            dbapi_connection: DBAPIConnection,
+            connection_record: ConnectionPoolEntry,
+        ) -> None:
+            # capabilities are negotiated for every newly established
+            # physical connection, including ones created after
+            # invalidation, so that a reconnect reaching a different
+            # server renegotiates against that server.  the first
+            # physical connection was already negotiated by
+            # dialect.initialize() above and is simply skipped.
+            c = base.Connection(
+                engine,
+                connection=_AdhocProxiedConnection(
+                    dbapi_connection, connection_record
+                ),
+                _has_events=False,
+                _allow_revalidate=False,
+                _allow_autobegin=False,
+            )
+            c._execution_options = util.EMPTY_DICT
+
+            negotiated = False
+            try:
+                negotiated = dialect.capabilities.handle_connect(c)
+            finally:
+                if negotiated and not c.invalidated and not c.closed:
+                    # version detection / probes may leave a
+                    # transaction open, as within first_connect()
+                    dialect.do_rollback(c.connection)
+
+        event.listen(pool, "connect", capability_connect)
+
     dialect_cls.engine_created(engine)
     if entrypoint is not dialect_cls:
         entrypoint.engine_created(engine)

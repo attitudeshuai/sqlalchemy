@@ -363,6 +363,32 @@ class AsyncConnection(  # type: ignore[misc]
     async def get_isolation_level(self) -> IsolationLevel:
         return await greenlet_spawn(self._proxied.get_isolation_level)
 
+    async def supports_capability(self, name: str) -> bool:
+        """Return whether capability ``name`` is supported on the server
+        this connection sees.
+
+        Async wrapper around
+        :meth:`_engine.Connection.supports_capability`; any capability
+        probe that has not yet run for this server is invoked within
+        the sync greenlet context.
+
+        .. versionadded:: 2.1
+
+        """
+        return await greenlet_spawn(
+            self._proxied.supports_capability, name
+        )
+
+    async def get_capability(self, name: str) -> Any:
+        """Return the effective value of capability ``name``.
+
+        Async wrapper around :meth:`_engine.Connection.get_capability`.
+
+        .. versionadded:: 2.1
+
+        """
+        return await greenlet_spawn(self._proxied.get_capability, name)
+
     def in_transaction(self) -> bool:
         """Return True if a transaction is in progress."""
 

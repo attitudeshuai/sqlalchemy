@@ -603,6 +603,40 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         else:
             return self._dbapi_connection
 
+    def supports_capability(self, name: str) -> bool:
+        """Return whether capability ``name`` is supported on the server
+        this connection sees.
+
+        This is the queryable entry point into the dialect's runtime
+        capability registry; the answer reflects what the actual server
+        reported (declared version-range differences and runtime probes),
+        negotiated and cached for this connection::
+
+            if connection.supports_capability("supports_identity_columns"):
+                ...
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :meth:`.Dialect.supports_capability`
+            :class:`.CapabilityRegistry`
+
+        """
+        return self.dialect.capabilities.supports(name, self)
+
+    def get_capability(self, name: str) -> Any:
+        """Return the effective value of capability ``name`` on the
+        server this connection sees.
+
+        Unlike :meth:`supports_capability`, supports capabilities whose
+        values are not plain booleans (tuples, tokens, enums).
+
+        .. versionadded:: 2.1
+
+        """
+        return self.dialect.capabilities.get_value(name, self)
+
     def get_isolation_level(self) -> IsolationLevel:
         """Return the current **actual** isolation level that's present on
         the database within the scope of this connection.

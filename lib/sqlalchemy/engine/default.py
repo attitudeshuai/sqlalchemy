@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 from typing import Union
 import weakref
 
+from . import capabilities as _capabilities
 from . import characteristics
 from . import cursor as _cursor
 from . import interfaces
@@ -292,6 +293,25 @@ class DefaultDialect(Dialect):
     sequences_optional = False
     preexecute_autoincrement_sequences = False
     supports_identity_columns = False
+
+    capability_declarations: Sequence[
+        _capabilities.CapabilityDeclaration
+    ] = ()
+    """Declarative capability specification consumed by
+    :attr:`.DefaultDialect.capabilities`.
+
+    Dialects list :class:`.CapabilityDeclaration` objects here to
+    declare class-level capability defaults that vary by server version
+    range and/or runtime probes.  Capabilities not listed here keep
+    behaving exactly like plain dialect class attributes.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :class:`.CapabilityRegistry`
+
+    """
     postfetch_lastrowid = True
     favor_returning_over_lastrowid = False
     insert_null_pk_still_autoincrements = False
@@ -529,6 +549,10 @@ class DefaultDialect(Dialect):
             self.insertmanyvalues_page_size = insertmanyvalues_page_size
 
         self._check_minimum_dbapi_version()
+
+        self.capabilities = _capabilities.CapabilityRegistry(
+            self, self.capability_declarations
+        )
 
     @property
     @util.deprecated(
@@ -790,6 +814,46 @@ class DefaultDialect(Dialect):
                 " maximum identifier length of %d"
                 % (self.label_length, self.max_identifier_length)
             )
+
+        # negotiate all declared capabilities against the server this
+        # first connection actually sees.  This replaces per-dialect
+        # ``self.supports_x = self.server_version_info >= (...)``
+        # assignments scattered across initialize() methods: the
+        # registry computes the effective values, runs any probes,
+        # records the provenance, and writes effective values back onto
+        # the dialect attributes.  Negotiation itself never raises.
+        self.capabilities.negotiate(
+            connection, server_version_info=self.server_version_info
+        )
+
+    def supports_capability(
+        self, connection: Optional[Connection], name: str
+    ) -> bool:
+        """Return whether capability ``name`` is supported on the server
+        the given connection sees.
+
+        This is the single queryable entry point for runtime
+        capability negotiation.  See :class:`.CapabilityRegistry` for
+        the full API, including non-boolean capabilities and capability
+        records.
+
+        .. versionadded:: 2.1
+
+        """
+        return self.capabilities.supports(name, connection)
+
+    def get_capability(
+        self, connection: Optional[Connection], name: str
+    ) -> Any:
+        """Return the effective value of capability ``name``.
+
+        Unlike :meth:`supports_capability`, this returns capabilities
+        whose values are not plain booleans (tuples, enums, tokens).
+
+        .. versionadded:: 2.1
+
+        """
+        return self.capabilities.get_value(name, connection)
 
     def on_connect(self) -> Optional[Callable[[Any], None]]:
         # inherits the docstring from interfaces.Dialect.on_connect

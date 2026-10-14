@@ -1972,6 +1972,8 @@ from ...engine import ObjectKind
 from ...engine import ObjectScope
 from ...engine import reflection
 from ...engine import URL
+from ...engine.capabilities import CapabilityDeclaration
+from ...engine.capabilities import CapabilityRule
 from ...engine.reflection import ReflectionDefaults
 from ...sql import bindparam
 from ...sql import coercions
@@ -3752,6 +3754,53 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
     reflection_options = ("postgresql_ignore_search_path",)
 
+    # version-dependent capabilities.  the class-level values below are
+    # the defaults (what a compile-only / un-negotiated dialect sees,
+    # matching the newest supported server); the registry applies the
+    # version range rules during connection negotiation, runs any
+    # probes, records the provenance and writes the effective values
+    # back onto the dialect attributes.
+    capability_declarations = (
+        # SMALLSERIAL arrived in 9.2
+        CapabilityDeclaration(
+            "supports_smallserial",
+            (CapabilityRule.below((9, 2), False),),
+        ),
+        CapabilityDeclaration(
+            "_supports_drop_index_concurrently",
+            (CapabilityRule.below((9, 2), False),),
+        ),
+        # IDENTITY columns arrived in 10
+        CapabilityDeclaration(
+            "supports_identity_columns",
+            (CapabilityRule.below((10,), False),),
+        ),
+        # jsonb subscripting arrived in 14
+        CapabilityDeclaration(
+            "_supports_jsonb_subscripting",
+            (CapabilityRule.below((14,), False),),
+        ),
+        # virtual generated columns arrived in 18
+        CapabilityDeclaration(
+            "supports_virtual_generated_columns",
+            (CapabilityRule.below((18,), False),),
+        ),
+        # pg_index.indnkeyatts arrived in 11; used by reflection
+        CapabilityDeclaration(
+            "supports_index_including_key_attributes",
+            (CapabilityRule.since((11, 0), True),),
+            default=False,
+            attribute=None,
+        ),
+        # pg_index.indnullsnotdistinct arrived in 15; used by reflection
+        CapabilityDeclaration(
+            "supports_index_nulls_not_distinct",
+            (CapabilityRule.since((15,), True),),
+            default=False,
+            attribute=None,
+        ),
+    )
+
     _backslash_escapes = False
     _supports_create_index_concurrently = True
     _supports_drop_index_concurrently = True
@@ -3772,24 +3821,14 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
         self._json_serializer = json_serializer
 
     def initialize(self, connection):
+        # super().initialize() negotiates ``capability_declarations``
+        # against the observed server version, applying what used to be
+        # the explicit ``self.supports_x = self.server_version_info >=
+        # (...)`` assignments below centrally, with version-range rules
+        # and runtime probe support.
         super().initialize(connection)
 
-        # https://www.postgresql.org/docs/9.3/static/release-9-2.html#AEN116689
-        self.supports_smallserial = self.server_version_info >= (9, 2)
-
         self._set_backslash_escapes(connection)
-
-        self._supports_drop_index_concurrently = self.server_version_info >= (
-            9,
-            2,
-        )
-        self.supports_identity_columns = self.server_version_info >= (10,)
-
-        self._supports_jsonb_subscripting = self.server_version_info >= (14,)
-
-        self.supports_virtual_generated_columns = self.server_version_info >= (
-            18,
-        )
 
     def get_isolation_level_values(self, dbapi_conn):
         # note the generic dialect doesn't have AUTOCOMMIT, however
@@ -4817,12 +4856,14 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
     @util.memoized_property
     def _constraint_query(self):
-        if self.server_version_info >= (11, 0):
+        if self.capabilities.supports(
+            "supports_index_including_key_attributes"
+        ):
             indnkeyatts = pg_catalog.pg_index.c.indnkeyatts
         else:
             indnkeyatts = pg_catalog.pg_index.c.indnatts.label("indnkeyatts")
 
-        if self.server_version_info >= (15,):
+        if self.capabilities.supports("supports_index_nulls_not_distinct"):
             indnullsnotdistinct = pg_catalog.pg_index.c.indnullsnotdistinct
         else:
             indnullsnotdistinct = sql.false().label("indnullsnotdistinct")
@@ -4952,7 +4993,10 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
                             cst_cols = all_cols
 
                         opts = {}
-                        if self.server_version_info >= (11,):
+                        if self.capabilities.supports(
+                            "supports_index_including_key_attributes",
+                            connection,
+                        ):
                             opts["postgresql_include"] = inc_cols
                         if is_unique:
                             opts["postgresql_nulls_not_distinct"] = row[
@@ -5300,12 +5344,14 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
             .subquery("idx_cols")
         )
 
-        if self.server_version_info >= (11, 0):
+        if self.capabilities.supports(
+            "supports_index_including_key_attributes"
+        ):
             indnkeyatts = pg_catalog.pg_index.c.indnkeyatts
         else:
             indnkeyatts = pg_catalog.pg_index.c.indnatts.label("indnkeyatts")
 
-        if self.server_version_info >= (15,):
+        if self.capabilities.supports("supports_index_nulls_not_distinct"):
             nulls_not_distinct = pg_catalog.pg_index.c.indnullsnotdistinct
         else:
             nulls_not_distinct = sql.false().label("indnullsnotdistinct")
@@ -5514,7 +5560,10 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
                         dialect_options["postgresql_where"] = row[
                             "filter_definition"
                         ]
-                    if self.server_version_info >= (11,):
+                    if self.capabilities.supports(
+                        "supports_index_including_key_attributes",
+                        connection,
+                    ):
                         dialect_options["postgresql_include"] = inc_cols
                     if row["indnullsnotdistinct"]:
                         # the default is False, so ignore it.

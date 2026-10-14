@@ -48,6 +48,7 @@ from ..util.typing import NotRequired
 if TYPE_CHECKING:
     from .base import Connection
     from .base import Engine
+    from .capabilities import CapabilityRegistry
     from .cursor import CursorResult
     from .url import URL
     from ..connectors.asyncio import AsyncIODBAPIConnection
@@ -775,6 +776,24 @@ class Dialect(EventTarget):
     typically populated during the initial connection to the database.
     """
 
+    capabilities: CapabilityRegistry
+    """the runtime capability registry for this dialect.
+
+    The registry converges capability judgement in one queryable
+    place: dialects declare defaults and version-range differences on
+    it, runtime probes negotiate against the server a connection
+    actually reaches, results are cached per observed server, and
+    execution branches query the registry instead of re-deriving
+    version comparisons.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :class:`.CapabilityRegistry`
+
+    """
+
     minimum_dbapi_version: Optional[util.VersionInfo] = None
     """The minimum version of the DBAPI which this dialect supports.
 
@@ -1499,6 +1518,33 @@ class Dialect(EventTarget):
            any :meth:`_engine.Dialect.on_connect` hooks are called.
 
         """
+
+    def supports_capability(
+        self, connection: Optional["Connection"], name: str
+    ) -> bool:
+        """Return whether capability ``name`` is supported on the server
+        the given connection sees.
+
+        Single queryable entry point for the dialect's runtime
+        :class:`.CapabilityRegistry`.
+
+        .. versionadded:: 2.1
+
+        """
+        raise NotImplementedError()
+
+    def get_capability(
+        self, connection: Optional["Connection"], name: str
+    ) -> Any:
+        """Return the effective value of capability ``name``.
+
+        Unlike :meth:`supports_capability`, supports capabilities whose
+        values are not plain booleans.
+
+        .. versionadded:: 2.1
+
+        """
+        raise NotImplementedError()
 
     if TYPE_CHECKING:
 

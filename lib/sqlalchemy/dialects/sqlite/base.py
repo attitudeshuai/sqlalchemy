@@ -1061,6 +1061,8 @@ from ... import util
 from ...engine import default
 from ...engine import processors
 from ...engine import reflection
+from ...engine.capabilities import CapabilityDeclaration
+from ...engine.capabilities import CapabilityRule
 from ...engine.reflection import ReflectionDefaults
 from ...sql import coercions
 from ...sql import compiler
@@ -2256,6 +2258,17 @@ class SQLiteDialect(default.DefaultDialect):
     _broken_fk_pragma_quotes = False
     _broken_dotted_colnames = False
 
+    # the table_xinfo pragma (hidden / generated column reflection)
+    # arrived in SQLite 3.31.0
+    supports_table_xinfo_pragma = False
+
+    capability_declarations = (
+        CapabilityDeclaration(
+            "supports_table_xinfo_pragma",
+            (CapabilityRule.since((3, 31, 0), True),),
+        ),
+    )
+
     def __init__(
         self,
         native_datetime: bool = False,
@@ -2509,7 +2522,9 @@ class SQLiteDialect(default.DefaultDialect):
     def get_columns(self, connection, table_name, schema=None, **kw):
         pragma = "table_info"
         # computed columns are threaded as hidden, they require table_xinfo
-        if self.server_version_info >= (3, 31):
+        if self.capabilities.supports(
+            "supports_table_xinfo_pragma", connection
+        ):
             pragma = "table_xinfo"
         info = self._get_table_pragma(
             connection, pragma, table_name, schema=schema

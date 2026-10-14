@@ -475,6 +475,22 @@ class AsyncEngineTest(EngineFixture):
             )
 
     @async_test
+    @testing.skip_if(lambda config: config.db.dialect.name != "sqlite")
+    async def test_supports_capability(self, async_engine):
+        async with async_engine.connect() as conn:
+            is_true(
+                await conn.supports_capability(
+                    "supports_table_xinfo_pragma"
+                )
+            )
+            eq_(
+                await conn.get_capability(
+                    "supports_table_xinfo_pragma"
+                ),
+                True,
+            )
+
+    @async_test
     async def test_transaction_accessor(self, async_connection):
         conn = async_connection
         is_none(conn.get_transaction())
