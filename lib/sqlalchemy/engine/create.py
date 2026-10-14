@@ -42,6 +42,7 @@ if typing.TYPE_CHECKING:
     from ..log import _EchoFlagType
     from ..pool import _CreatorFnType
     from ..pool import _CreatorWRecFnType
+    from ..pool import _LeaseActionArgType
     from ..pool import _ResetStyleArgType
     from ..pool import Pool
 
@@ -72,6 +73,9 @@ def create_engine(
     paramstyle: Optional[_ParamStyle] = ...,
     pool: Optional[Pool] = ...,
     poolclass: Optional[Type[Pool]] = ...,
+    pool_lease_on_expire: _LeaseActionArgType = ...,
+    pool_lease_reap_interval: Optional[float] = ...,
+    pool_lease_time: float = ...,
     pool_logging_name: str = ...,
     pool_pre_ping: bool = ...,
     pool_size: int = ...,
@@ -481,6 +485,26 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
 
             :ref:`pool_disconnects`
 
+    :param pool_lease_time=-1: number of seconds a connection may remain
+        checked out before its checkout lease is considered expired.  When
+        left at the default of ``-1`` checkout lease governance is disabled
+        and pool behavior is unchanged.  When enabled, expired leases are
+        exposed via :meth:`_pool.Pool.expired_leases`, emit the
+        :meth:`.PoolEvents.lease_expired` event, and are handled according
+        to :paramref:`_sa.create_engine.pool_lease_on_expire`.
+
+        .. versionadded:: 2.1
+
+    :param pool_lease_on_expire="log": selects what happens to a connection
+        whose checkout lease has expired: ``"log"`` (record/event only),
+        ``"reclaim"`` (forcibly reclaim the connection, invalidating the
+        handle still held by the borrower with
+        :class:`~sqlalchemy.exc.LeaseExpiredError`) or ``"invalidate"``
+        (leave it with the borrower but terminate and recycle it on
+        return).
+
+        .. versionadded:: 2.1
+
     :param plugins: string list of plugin names to load.  See
         :class:`.CreateEnginePlugin` for background.
 
@@ -834,6 +858,9 @@ def create_pool_from_url(
     reset_on_return: Optional[_ResetStyleArgType] = ...,
     timeout: float = ...,
     use_lifo: bool = ...,
+    lease_time: float = ...,
+    lease_on_expire: _LeaseActionArgType = ...,
+    lease_reap_interval: Optional[float] = ...,
     **kwargs: Any,
 ) -> Pool: ...
 
@@ -873,5 +900,8 @@ _pool_translate_kwargs = immutabledict(
         "reset_on_return": "pool_reset_on_return",
         "pre_ping": "pool_pre_ping",
         "use_lifo": "pool_use_lifo",
+        "lease_time": "pool_lease_time",
+        "lease_on_expire": "pool_lease_on_expire",
+        "lease_reap_interval": "pool_lease_reap_interval",
     }
 )

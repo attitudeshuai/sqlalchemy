@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import inspect as stdlib_inspect
+import threading
 from unittest.mock import patch
 
 from sqlalchemy import AssertionPool
@@ -1697,3 +1698,128 @@ class PoolRegenTest(EngineFixture):
 
         tasks = [thing(engine) for _ in range(10)]
         await asyncio.gather(*tasks)
+
+
+class PoolLeaseTest(fixtures.TestBase):
+    __requires__ = ("async_dialect",)
+    __backend__ = True
+
+    def _assert_lease_expired_error(self, error: BaseException) -> None:
+        # a LeaseExpiredError raised on the pooled connection may be
+        # surfaced directly or wrapped in a StatementError at statement
+        # execution time
+        candidates = [
+            error,
+            getattr(error, "orig", None),
+            error.__cause__,
+        ]
+        if any(isinstance(c, exc.LeaseExpiredError) for c in candidates):
+            return
+        raise AssertionError(
+            "LeaseExpiredError not found in exception chain: %r" % error
+        )
+
+    @staticmethod
+    async def _wait_for_event(event: threading.Event) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not event.is_set():
+            if loop.time() > deadline:
+                raise AssertionError("event was not set")
+            await asyncio.sleep(0.02)
+
+    @async_test
+    async def test_lease_tracking(self, async_testing_engine):
+        engine = async_testing_engine(
+            options={
+                "poolclass": AsyncAdaptedQueuePool,
+                "pool_size": 1,
+                "max_overflow": 0,
+                "pool_lease_time": 10,
+            }
+        )
+        try:
+            async with engine.connect() as conn:
+                await conn.exec_driver_sql(str(select(1).compile(engine)))
+                leases = engine.pool.checked_out_leases()
+                eq_(len(leases), 1)
+                eq_(leases[0].state, "active")
+                assert not leases[0].expired
+                # source / traceback are captured (the most recent
+                # external frame depends on the event loop runner;
+                # under plain asyncio.run it is the calling coroutine)
+                assert leases[0].source
+                assert leases[0].traceback
+            eq_(engine.pool.checked_out_leases(), [])
+        finally:
+            await engine.dispose()
+
+    @testing.requires.timing_intensive
+    @async_test
+    async def test_lease_reclaim(self, async_testing_engine):
+        engine = async_testing_engine(
+            options={
+                "poolclass": AsyncAdaptedQueuePool,
+                "pool_size": 1,
+                "max_overflow": 0,
+                "pool_lease_time": 0.1,
+                "pool_lease_on_expire": "reclaim",
+                "pool_lease_reap_interval": 0.02,
+            }
+        )
+        fired = threading.Event()
+        event.listen(engine.pool, "lease_expired", lambda *a: fired.set())
+        try:
+            async with engine.connect() as conn:
+                # the reaper thread signals; the event fires cross-thread
+                await self._wait_for_event(fired)
+                # the reaper schedules enforcement onto this event loop;
+                # allow the scheduled callback to run
+                await asyncio.sleep(0.1)
+                eq_(engine.pool.expired_leases()[-1].state, "reclaimed")
+                try:
+                    await conn.exec_driver_sql(str(select(1).compile(engine)))
+                except Exception as e:
+                    self._assert_lease_expired_error(e)
+                else:
+                    raise AssertionError("expected LeaseExpiredError")
+
+            # next borrower gets a working, fresh connection
+            async with engine.connect() as conn2:
+                result = await conn2.exec_driver_sql(
+                    str(select(1).compile(engine))
+                )
+                eq_(result.scalar(), 1)
+        finally:
+            await engine.dispose()
+
+    @testing.requires.timing_intensive
+    @async_test
+    async def test_lease_invalidate_on_return(self, async_testing_engine):
+        engine = async_testing_engine(
+            options={
+                "poolclass": AsyncAdaptedQueuePool,
+                "pool_size": 1,
+                "max_overflow": 0,
+                "pool_lease_time": 0.1,
+                "pool_lease_on_expire": "invalidate",
+                "pool_lease_reap_interval": 0.02,
+            }
+        )
+        try:
+            async with engine.connect() as conn:
+                await conn.exec_driver_sql(str(select(1).compile(engine)))
+                await asyncio.sleep(0.3)
+                eq_(
+                    engine.pool.checked_out_leases()[0].state,
+                    "invalidated",
+                )
+            # suspect connection was recycled; a new borrower still works
+            async with engine.connect() as conn2:
+                result = await conn2.exec_driver_sql(
+                    str(select(1).compile(engine))
+                )
+                eq_(result.scalar(), 1)
+            eq_(engine.pool.expired_leases()[-1].state, "returned")
+        finally:
+            await engine.dispose()

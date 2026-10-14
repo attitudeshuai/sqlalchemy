@@ -592,6 +592,75 @@ Note that the flag only applies to :class:`.QueuePool` use.
     :ref:`pool_disconnects`
 
 
+.. _pool_checkout_leases:
+
+Detecting and Reclaiming Connections Held Too Long (Checkout Leases)
+--------------------------------------------------------------------
+
+The pool normally only constrains how long a borrower *waits* for a
+connection (``timeout``); once a connection is checked out, it may be held
+for an unbounded amount of time, occupying one of the pool's slots even
+when the calling code is stuck or has leaked the connection.
+
+When :paramref:`_pool.Pool.lease_time` is set to a non-negative number of
+seconds (also available from :func:`_sa.create_engine` as
+:paramref:`_sa.create_engine.pool_lease_time`), every checked-out
+connection receives a **lease** that records:
+
+* when it was checked out and when it expires,
+* the current occupancy time,
+* the calling stack / most recent caller that checked it out, and
+* the thread (or event loop task) that holds it.
+
+Expired leases are enforced by a lightweight background reaper thread and
+opportunistically while other connections are checked out. An expired
+connection:
+
+* is added to the queryable expired lease list,
+  :meth:`_pool.Pool.expired_leases`, while all currently checked-out leases
+  are returned by :meth:`_pool.Pool.checked_out_leases`;
+* emits the :meth:`.PoolEvents.lease_expired` event exactly once; the same
+  information is included in :meth:`_pool.Pool.status` output.
+
+What happens next is selected by
+:paramref:`_pool.Pool.lease_on_expire`
+(:paramref:`_sa.create_engine.pool_lease_on_expire`):
+
+``"log"`` (default)
+    Nothing else is done; the expired connection remains with the
+    borrower, which keeps full use of it.  Use the event and the expired
+    lease list for monitoring and alerting.
+
+``"reclaim"``
+    The pool forcibly takes the connection back: its slot/capacity is
+    returned to the pool (waking up borrowers that were waiting for a
+    connection), its database connection is terminated, and any further
+    use of the connection handle still held by the original borrower
+    raises :class:`~sqlalchemy.exc.LeaseExpiredError` - rather than
+    silently writing into a connection that may already have been handed
+    to another borrower.  The next checkout establishes a brand new
+    connection.
+
+``"invalidate"``
+    The expired connection is marked suspect and left with the borrower,
+    but when it is released (including when it is garbage collected) it is
+    terminated and recycled instead of being returned to the idle pool,
+    so the next borrower never receives a possibly stale connection.  No
+    reset (e.g. ``ROLLBACK``) is attempted on the suspect connection.
+
+With leases disabled (the default, ``lease_time=-1``) pool behavior is
+unchanged in every respect; the waiting ``timeout`` and ``pre_ping`` are
+unaffected by the lease settings.
+
+.. versionadded:: 2.1
+
+.. seealso::
+
+    :class:`.LeaseStatus`
+
+    :meth:`.PoolEvents.lease_expired`
+
+
 .. _pooling_multiprocessing:
 
 Using Connection Pools with Multiprocessing or os.fork()

@@ -24,8 +24,11 @@ from .base import _ConnectionRecord
 from .base import _CreatorFnType as _CreatorFnType
 from .base import _CreatorWRecFnType as _CreatorWRecFnType
 from .base import _finalize_fairy
+from .base import _LeaseActionArgType as _LeaseActionArgType
 from .base import _ResetStyleArgType as _ResetStyleArgType
 from .base import ConnectionPoolEntry as ConnectionPoolEntry
+from .base import LeaseAction as LeaseAction
+from .base import LeaseStatus as LeaseStatus
 from .base import ManagesConnection as ManagesConnection
 from .base import Pool as Pool
 from .base import PoolProxiedConnection as PoolProxiedConnection

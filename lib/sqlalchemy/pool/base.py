@@ -13,13 +13,16 @@ from __future__ import annotations
 from collections import deque
 import dataclasses
 from enum import Enum
+import os
 import threading
 import time
+import traceback
 import typing
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Deque
+from typing import Dict
 from typing import List
 from typing import Literal
 from typing import Optional
@@ -105,6 +108,295 @@ _ResetStyleArgType = Union[
 reset_rollback, reset_commit, reset_none = list(ResetStyle)
 
 
+class LeaseAction(Enum):
+    """Describe the action taken by the pool when a checked-out
+    connection exceeds its configured lease.
+
+    .. versionadded:: 2.1
+
+    """
+
+    #: the expired connection is recorded in the expired lease list and
+    #: the :meth:`_events.PoolEvents.lease_expired` event is emitted;
+    #: nothing else is done.
+    log = "log"
+
+    #: the expired connection is forcibly reclaimed by the pool: its
+    #: capacity is released back to the pool and the connection handle
+    #: still held by the borrower is invalidated, raising
+    #: :class:`~sqlalchemy.exc.LeaseExpiredError` on further use.
+    reclaim = "reclaim"
+
+    #: the expired connection is marked suspect and left with the
+    #: borrower; it is terminated and recycled (rather than returned to
+    #: the idle pool) when the borrower finally releases it.
+    invalidate = "invalidate"
+
+
+lease_log, lease_reclaim, lease_invalidate = list(LeaseAction)
+
+_LeaseActionArgType = Union[
+    LeaseAction, Literal["log", "reclaim", "invalidate"]
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class LeaseStatus:
+    """Immutable snapshot of the state of a single checked-out connection
+    lease.
+
+    Instances are delivered to the :meth:`_events.PoolEvents.lease_expired`
+    event and returned by :meth:`_pool.Pool.checked_out_leases` and
+    :meth:`_pool.Pool.expired_leases`.
+
+    .. versionadded:: 2.1
+
+    """
+
+    __slots__ = (
+        "connection_record",
+        "dbapi_connection",
+        "checked_out_at",
+        "lease_time",
+        "expires_at",
+        "age",
+        "thread_ident",
+        "source",
+        "traceback",
+        "expired",
+        "state",
+    )
+
+    connection_record: ConnectionPoolEntry
+    """the :class:`.ConnectionPoolEntry` to which the lease applies."""
+
+    dbapi_connection: Optional[DBAPIConnection]
+    """the DBAPI connection associated with the lease at the time the
+    snapshot was taken; this is ``None`` if the connection was already
+    reclaimed."""
+
+    checked_out_at: float
+    """``time.time()`` at which the connection was checked out."""
+
+    lease_time: float
+    """configured lease duration, in seconds."""
+
+    expires_at: float
+    """``time.time()`` value at which the lease is considered expired."""
+
+    age: float
+    """seconds elapsed since checkout at the time the snapshot was taken."""
+
+    thread_ident: int
+    """identifier of the thread that checked the connection out."""
+
+    source: str
+    """short description (``filename:lineno in callable``) of the most
+    recent caller outside of SQLAlchemy on the checkout call stack."""
+
+    traceback: str
+    """formatted checkout call stack leading to the most recent caller
+    outside of SQLAlchemy, useful for diagnosing which borrower holds the
+    connection."""
+
+    expired: bool
+    """True if the lease had expired when the snapshot was taken."""
+
+    state: Literal["active", "expired", "invalidated", "reclaimed", "returned"]
+    """disposition state of the lease:
+
+    ``"active"``
+      the lease has not expired;
+
+    ``"expired"``
+      the lease has expired and is being recorded only
+      (:class:`.LeaseAction.log`);
+
+    ``"invalidated"``
+      the lease has expired with :class:`.LeaseAction.invalidate`; the
+      connection is still with the borrower but will be recycled when it
+      is returned;
+
+    ``"reclaimed"``
+      the connection was forcibly reclaimed by the pool
+      (:class:`.LeaseAction.reclaim`);
+
+    ``"returned"``
+      an expired lease was resolved when the borrower finally released
+      the connection.
+
+    """
+
+    def status_line(self) -> str:
+        """Return a one-line human readable description of the lease."""
+
+        return "Lease age=%.2fs limit=%.2fs state=%s source=%s thread=%s" % (
+            self.age,
+            self.lease_time,
+            self.state,
+            self.source,
+            self.thread_ident,
+        )
+
+
+class _Lease:
+    """Mutable per-checkout lease bookkeeping (internal)."""
+
+    __slots__ = (
+        "starttime",
+        "lease_time",
+        "expires_at",
+        "source",
+        "traceback_text",
+        "thread_ident",
+        "event_loop",
+        "expired",
+        "disposition",
+        "reclaimed",
+    )
+
+    starttime: float
+    lease_time: float
+    expires_at: float
+    source: str
+    traceback_text: str
+    thread_ident: int
+    event_loop: Any
+    expired: bool
+    disposition: Optional[LeaseAction]
+    reclaimed: bool
+
+    def __init__(
+        self,
+        lease_time: float,
+        source: str,
+        traceback_text: str,
+        thread_ident: int,
+        event_loop: Any,
+    ):
+        self.starttime = time.time()
+        self.lease_time = lease_time
+        self.expires_at = self.starttime + lease_time
+        self.source = source
+        self.traceback_text = traceback_text
+        self.thread_ident = thread_ident
+        self.event_loop = event_loop
+        self.expired = False
+        self.disposition = None
+        self.reclaimed = False
+
+
+def _current_event_loop() -> Any:
+    """Return the running asyncio event loop, if any, else None."""
+
+    try:
+        import asyncio
+
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+    except ImportError:  # pragma: no cover
+        return None
+
+
+def _checkout_stack_frames() -> List[traceback.FrameSummary]:
+    """Return the frames of the current checkout call stack.
+
+    When the pool is driven from an asyncio engine, checkout runs inside
+    a worker greenlet whose own frame chain never contains the calling
+    user coroutine.  The user code is suspended on the parent (asyncio)
+    greenlet, so its frame chain is appended.
+
+    """
+
+    frames = list(traceback.extract_stack()[:-1])
+
+    # asyncio checkout runs inside a worker greenlet; this walks the
+    # suspended parent (asyncio) greenlet to reach the calling coroutine.
+    # greenlet is an optional dependency (sync-only installs may not
+    # have it), and sync checkout has no parent greenlet to walk.
+    try:
+        import greenlet
+    except ImportError:
+        greenlet = None  # type: ignore[assignment]
+
+    if greenlet is not None:
+        current = greenlet.getcurrent()
+        if getattr(current, "__sqlalchemy_greenlet_provider__", False):
+            frame = getattr(current.parent, "gr_frame", None)
+            while frame is not None:
+                frames.append(
+                    traceback.FrameSummary(
+                        frame.f_code.co_filename,
+                        frame.f_lineno,
+                        frame.f_code.co_name,
+                        lookup_line=False,
+                    )
+                )
+                frame = frame.f_back
+    return frames
+
+
+def _checkout_caller_source() -> Tuple[str, str]:
+    """Derive ``(short_source, traceback_text)`` describing the most
+    recent non-SQLAlchemy caller on the current checkout stack."""
+
+    package_prefix = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    frames = _checkout_stack_frames()
+    external = [
+        frame
+        for frame in frames
+        if not os.path.abspath(frame.filename).startswith(package_prefix)
+    ]
+    if external:
+        chosen = external[-1]
+        relevant = external[-25:]
+    elif frames:
+        chosen = frames[-1]
+        relevant = [chosen]
+    else:  # pragma: no cover
+        return "<unknown>", ""
+
+    lineno = chosen.lineno if chosen.lineno is not None else 0
+    return (
+        "%s:%d in %s" % (chosen.filename, lineno, chosen.name),
+        "".join(traceback.format_list(relevant)),
+    )
+
+
+class _LeaseReaper(threading.Thread):
+    """Background daemon thread that enforces expired checkout leases."""
+
+    def __init__(self, pool: Pool):
+        super().__init__(daemon=True)
+        self.name = "sqlalchemy-pool-lease-reaper-%#x" % id(pool)
+        self._pool_ref = weakref.ref(pool)
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        pool = self._pool_ref()
+        if pool is None:
+            return
+        interval = pool._lease_reap_interval
+        while not self._stop_event.wait(interval):
+            pool = self._pool_ref()
+            if pool is None:
+                return
+            try:
+                pool._reap_expired_leases()
+            except BaseException:
+                pool.logger.error(
+                    "Unhandled exception in lease reaper thread",
+                    exc_info=True,
+                )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
 class _ConnDialect:
     """partial implementation of :class:`.Dialect`
     which provides DBAPI connection methods.
@@ -174,6 +466,9 @@ class Pool(log.Identified, event.EventTarget):
         events: Optional[List[Tuple[_ListenerFnType, str]]] = None,
         dialect: Optional[Union[_ConnDialect, Dialect]] = None,
         pre_ping: bool = False,
+        lease_time: float = -1,
+        lease_on_expire: _LeaseActionArgType = "log",
+        lease_reap_interval: Optional[float] = None,
         _dispatch: Optional[_DispatchCommon[Pool]] = None,
     ):
         """
@@ -269,6 +564,53 @@ class Pool(log.Identified, event.EventTarget):
          invalidated.     Requires that a dialect is passed as well to
          interpret the disconnection error.
 
+        :param lease_time: number of seconds a connection may remain checked
+         out before its lease is considered expired.  Defaults to ``-1``,
+         which disables checkout lease governance entirely; when leases are
+         disabled the pool behaves exactly as it does without the lease
+         feature.  When set to a value greater than or equal to zero, every
+         checked-out connection receives a lease that records its checkout
+         time and calling source, and expired leases are detected by a
+         background reaper thread as well as opportunistically on further
+         checkouts.  Expired leases are listed by
+         :meth:`_pool.Pool.expired_leases` and emit the
+         :meth:`_events.PoolEvents.lease_expired` event exactly once.  The
+         ``lease_time`` limit constrains how long a borrower may *hold* a
+         connection; it is distinct from the :paramref:`_pool.Pool.timeout`
+         waiting limit and does not change checkout waiting or ``pre_ping``
+         behavior.
+
+         .. versionadded:: 2.1
+
+        :param lease_on_expire: selects what the pool does once a checked-out
+         lease is expired.  Defaults to ``"log"``.  Valid values are:
+
+         * ``"log"`` - record the expired lease in
+           :meth:`_pool.Pool.expired_leases` and emit
+           :meth:`_events.PoolEvents.lease_expired`; the borrower keeps the
+           connection.
+         * ``"reclaim"`` - in addition to recording and emitting the event,
+           forcibly reclaim the connection: its capacity is returned to the
+           pool, and the connection handle held by the original borrower is
+           invalidated such that any further use raises
+           :class:`~sqlalchemy.exc.LeaseExpiredError`, rather than affecting
+           a connection that may already have been handed to another
+           borrower.
+         * ``"invalidate"`` - mark the expired connection suspect; it is
+           left with the borrower, but when it is released (including via
+           garbage collection) it is terminated and recycled instead of
+           being returned to the idle pool, so a possibly stale connection
+           is never handed to the next borrower.
+
+         .. versionadded:: 2.1
+
+        :param lease_reap_interval: optional interval in seconds at which the
+         background lease reaper thread scans checked-out leases.  Defaults
+         to ``None``, which selects half of ``lease_time`` (with a minimum of
+         0.05 seconds).
+
+         .. versionadded:: 2.1
+
         """
         if logging_name:
             self.logging_name = self._orig_logging_name = logging_name
@@ -292,6 +634,39 @@ class Pool(log.Identified, event.EventTarget):
 
         self.echo = echo
 
+        if lease_time != -1 and lease_time < 0:
+            raise exc.ArgumentError(
+                "lease_time must be -1 (disabled) or a non-negative number "
+                "of seconds, got: %r" % (lease_time,)
+            )
+        self._lease_time = float(lease_time)
+        parsed_lease_on_expire = util.parse_user_argument_for_enum(
+            lease_on_expire,
+            {
+                LeaseAction.log: ["log"],
+                LeaseAction.reclaim: ["reclaim"],
+                LeaseAction.invalidate: ["invalidate"],
+            },
+            "lease_on_expire",
+        )
+        if parsed_lease_on_expire is None:
+            raise exc.ArgumentError(
+                "lease_on_expire must be one of 'log', 'reclaim' or "
+                "'invalidate', got: %r" % (lease_on_expire,)
+            )
+        self._lease_on_expire = parsed_lease_on_expire
+        if lease_reap_interval is not None:
+            self._lease_reap_interval = float(lease_reap_interval)
+        elif self._lease_time >= 0:
+            self._lease_reap_interval = max(0.05, self._lease_time / 2.0)
+        else:
+            self._lease_reap_interval = 1.0
+
+        self._leases: Dict[_ConnectionRecord, _Lease] = {}
+        self._lease_history: Dict[int, LeaseStatus] = {}
+        self._lease_lock = threading.RLock()
+        self._reaper: Optional[_LeaseReaper] = None
+
         if _dispatch:
             self.dispatch._update(_dispatch, only_propagate=False)
         if dialect:
@@ -303,6 +678,10 @@ class Pool(log.Identified, event.EventTarget):
     @util.hybridproperty
     def _is_asyncio(self) -> bool:
         return self._dialect.is_async
+
+    @util.hybridproperty
+    def _lease_enabled(self) -> bool:
+        return self._lease_time >= 0
 
     @property
     def _creator(self) -> Union[_CreatorFnType, _CreatorWRecFnType]:
@@ -466,6 +845,370 @@ class Pool(log.Identified, event.EventTarget):
     def status(self) -> str:
         """Returns a brief description of the state of this pool."""
         raise NotImplementedError()
+
+    # ------------------------------------------------------------------
+    # checkout lease governance
+    # ------------------------------------------------------------------
+
+    def _lease_snapshot(
+        self,
+        lease: _Lease,
+        record: ConnectionPoolEntry,
+        state: str,
+        now: Optional[float] = None,
+    ) -> LeaseStatus:
+        if now is None:
+            now = time.time()
+        return LeaseStatus(
+            connection_record=record,
+            dbapi_connection=record.dbapi_connection,
+            checked_out_at=lease.starttime,
+            lease_time=lease.lease_time,
+            expires_at=lease.expires_at,
+            age=max(0.0, now - lease.starttime),
+            thread_ident=lease.thread_ident,
+            source=lease.source,
+            traceback=lease.traceback_text,
+            expired=lease.expired or now >= lease.expires_at,
+            state=state,  # type: ignore[arg-type]
+        )
+
+    def _record_lease_history(
+        self,
+        lease: _Lease,
+        record: ConnectionPoolEntry,
+        state: str,
+        now: Optional[float] = None,
+    ) -> LeaseStatus:
+        snapshot = self._lease_snapshot(lease, record, state, now)
+        history = self._lease_history
+        history[id(lease)] = snapshot
+        if len(history) > 100:
+            for key in tuple(history)[:-100]:
+                del history[key]
+        return snapshot
+
+    def _lease_state_for(self, lease: _Lease) -> str:
+        if not lease.expired:
+            return "active"
+        elif lease.disposition is lease_invalidate:
+            return "invalidated"
+        elif lease.disposition is lease_reclaim:
+            return "reclaimed"
+        else:
+            return "expired"
+
+    def checked_out_leases(self) -> List[LeaseStatus]:
+        """Return :class:`.LeaseStatus` snapshots for all connections
+        currently checked out from this pool under a lease.
+
+        Each snapshot includes the current occupancy time (``age``) and
+        the most recent checkout source (``source`` and ``traceback``).
+        Returns an empty list when checkout leases are not configured.
+
+        .. versionadded:: 2.1
+
+        """
+
+        if not self._lease_enabled:
+            return []
+        with self._lease_lock:
+            now = time.time()
+            return [
+                self._lease_snapshot(
+                    lease, record, self._lease_state_for(lease), now
+                )
+                for record, lease in self._leases.items()
+            ]
+
+    def expired_leases(self) -> List[LeaseStatus]:
+        """Return the current expired-lease list.
+
+        The list contains one :class:`.LeaseStatus` entry per lease that
+        has ever expired, updated with its current disposition
+        (``"expired"``, ``"invalidated"``, ``"reclaimed"`` or
+        ``"returned"``).  The list is bounded to the 100 most recent
+        expired leases.
+
+        .. versionadded:: 2.1
+
+        """
+
+        if not self._lease_enabled:
+            return []
+        with self._lease_lock:
+            return list(self._lease_history.values())
+
+    def reap_expired_leases(self) -> None:
+        """Run an immediate enforcement pass over checked-out leases.
+
+        This is normally performed by the background reaper thread and
+        opportunistically at checkout; it is exposed to allow deterministic
+        enforcement by applications and tests.
+
+        .. versionadded:: 2.1
+
+        """
+
+        if self._lease_enabled:
+            self._reap_expired_leases()
+
+    def _lease_begin(
+        self, record: _ConnectionRecord, fairy: _ConnectionFairy
+    ) -> None:
+        if not self._lease_enabled:
+            return
+
+        source, traceback_text = _checkout_caller_source()
+        event_loop = _current_event_loop() if self._is_asyncio else None
+
+        lease = _Lease(
+            self._lease_time,
+            source,
+            traceback_text,
+            threading.get_ident(),
+            event_loop,
+        )
+        record._lease = lease
+        with self._lease_lock:
+            self._leases[record] = lease
+            self._start_reaper_locked()
+
+        # enforce other, already outstanding leases; the brand new lease
+        # is not itself reaped on this pass.
+        self._reap_expired_leases(_except_lease=lease)
+
+    def _lease_end(self, record: _ConnectionRecord) -> None:
+        if not self._lease_enabled:
+            return
+        with self._lease_lock:
+            lease = self._leases.pop(record, None)
+            record._lease = None
+            record._lease_invalid_on_return = False
+            if lease is not None and lease.expired:
+                state = (
+                    "reclaimed"
+                    if lease.reclaimed or lease.disposition is lease_reclaim
+                    else "returned"
+                )
+                self._record_lease_history(lease, record, state)
+
+    def _start_reaper_locked(self) -> None:
+        reaper = self._reaper
+        if reaper is None or not reaper.is_alive():
+            reaper = _LeaseReaper(self)
+            self._reaper = reaper
+            reaper.start()
+
+    def _stop_reaper(self) -> None:
+        if not self._lease_enabled:
+            return
+        with self._lease_lock:
+            reaper = self._reaper
+            self._reaper = None
+        if reaper is not None and reaper.is_alive():
+            reaper.stop()
+            reaper.join(timeout=1.0)
+
+    def _reap_expired_leases(
+        self, _except_lease: Optional[_Lease] = None
+    ) -> None:
+        now = time.time()
+        newly_expired: List[Tuple[_ConnectionRecord, _Lease]] = []
+        with self._lease_lock:
+            for record, lease in list(self._leases.items()):
+                if (
+                    lease is not _except_lease
+                    and not lease.expired
+                    and now >= lease.expires_at
+                ):
+                    lease.expired = True
+                    lease.disposition = self._lease_on_expire
+                    newly_expired.append((record, lease))
+
+        for record, lease in newly_expired:
+            self._enforce_expired_lease(record, lease)
+
+    def _enforce_expired_lease(
+        self, record: _ConnectionRecord, lease: _Lease
+    ) -> None:
+        now = time.time()
+        with self._lease_lock:
+            initial_state = (
+                "invalidated"
+                if lease.disposition is lease_invalidate
+                else "expired"
+            )
+            snapshot = self._record_lease_history(
+                lease, record, initial_state, now
+            )
+
+        # the event hook fires exactly once per expired lease
+        try:
+            self.dispatch.lease_expired(
+                record.dbapi_connection, record, snapshot
+            )
+        except BaseException:
+            self.logger.error(
+                "Exception raised by lease_expired event handler",
+                exc_info=True,
+            )
+
+        self.logger.warning(
+            "Connection %r checkout lease expired after %.2fs "
+            "(limit %.2fs); action=%s source=%s",
+            record.dbapi_connection,
+            snapshot.age,
+            lease.lease_time,
+            lease.disposition.value if lease.disposition is not None else None,
+            lease.source,
+        )
+
+        if lease.disposition is lease_invalidate:
+            self._mark_lease_invalid_on_return(record)
+        elif lease.disposition is lease_reclaim:
+            self._reclaim_lease(record, lease)
+
+    def _mark_lease_invalid_on_return(self, record: _ConnectionRecord) -> None:
+        with self._lease_lock:
+            record._lease_invalid_on_return = True
+        ref = record.fairy_ref
+        fairy = ref() if ref is not None else None
+        if fairy is not None:
+            fairy._lease_invalidated = True
+
+    def _lease_expired_error(
+        self, record: ConnectionPoolEntry, lease: _Lease, action: str
+    ) -> exc.LeaseExpiredError:
+        return exc.LeaseExpiredError(
+            "The pooled connection %r was %s by the pool after its "
+            "checkout lease of %.2f seconds expired (the connection was "
+            "held for %.2f seconds; checkout source: %s).  Further use of "
+            "this connection handle is not permitted."
+            % (
+                record.dbapi_connection,
+                action,
+                lease.lease_time,
+                time.time() - lease.starttime,
+                lease.source,
+            )
+        )
+
+    def _reclaim_lease(self, record: _ConnectionRecord, lease: _Lease) -> None:
+        error = self._lease_expired_error(record, lease, "forcibly reclaimed")
+
+        # 1. cut the borrower's connection handle FIRST, so no further
+        # read or write can land on the connection being reclaimed
+        ref = record.fairy_ref
+        fairy = ref() if ref is not None else None
+        if fairy is not None:
+            fairy._reclaimed_exc = error
+            fairy._lease_invalidated = True
+
+        # 2. for asyncio pools, the record must be enqueued back onto the
+        # event loop the asyncio queue is bound to; the handle was already
+        # invalidated above regardless of whether scheduling succeeds.
+        if self._is_asyncio:
+            loop = lease.event_loop
+            loop_is_open = loop is not None and not loop.is_closed()
+            if loop_is_open:
+                try:
+                    loop.call_soon_threadsafe(
+                        self._reclaim_lease_on_loop, record, lease
+                    )
+                    return
+                except RuntimeError:
+                    pass
+
+            # no usable event loop: cannot safely terminate or re-enqueue
+            # from another thread; degrade to recycle-on-return.
+            self.logger.warning(
+                "Connection %r lease expired but it cannot be forcibly "
+                "reclaimed outside of its event loop; the connection "
+                "will be recycled when returned by the borrower",
+                record.dbapi_connection,
+            )
+            with self._lease_lock:
+                lease.disposition = lease_invalidate
+                record._lease_invalid_on_return = True
+                self._record_lease_history(lease, record, "invalidated")
+            return
+
+        self._reclaim_lease_sync(record, lease, fairy)
+
+    def _reclaim_lease_sync(
+        self,
+        record: _ConnectionRecord,
+        lease: _Lease,
+        fairy: Optional[_ConnectionFairy],
+    ) -> None:
+        # 3. detach and terminate the raw connection (best effort;
+        # _close_connection logs rather than raising on failure), so the
+        # next checkout establishes a brand new connection
+        raw_connection = record.dbapi_connection
+        record.finalize_callback.clear()
+        record.dbapi_connection = None
+        if raw_connection is not None:
+            self._close_connection(raw_connection, terminate=True)
+
+        # 4. give the record (its capacity) back to the pool
+        if fairy is not None:
+            fairy.dbapi_connection = None  # type: ignore[assignment]
+            # this runs the record checkin (with no reset, as the
+            # connection is already gone) and enqueues it back to the pool
+            fairy._checkin()
+        # if the fairy was already garbage collected, its weakref
+        # finalizer performs the checkin itself; the record no longer
+        # references a connection so nothing stale can be re-used.
+
+        with self._lease_lock:
+            self._leases.pop(record, None)
+            record._lease = None
+            lease.reclaimed = True
+            self._record_lease_history(lease, record, "reclaimed")
+
+    def _reclaim_lease_on_loop(
+        self, record: _ConnectionRecord, lease: _Lease
+    ) -> None:
+        """Running on the asyncio event loop thread: terminate and
+        check in a forcibly reclaimed connection."""
+
+        # if the borrower already returned the connection (and the record
+        # possibly started a new lease in the meantime), nothing is left
+        # to reclaim here
+        with self._lease_lock:
+            if self._leases.get(record) is not lease:
+                return
+        if not lease.expired:
+            return
+
+        raw_connection = record.dbapi_connection
+        if raw_connection is not None and self._dialect.has_terminate:
+            self._close_connection(raw_connection, terminate=True)
+
+        ref = record.fairy_ref
+        fairy = ref() if ref is not None else None
+        record.finalize_callback.clear()
+        record.dbapi_connection = None
+        if fairy is not None:
+            fairy.dbapi_connection = None  # type: ignore[assignment]
+            try:
+                fairy._checkin()
+            except BaseException:
+                self.logger.error(
+                    "Exception checking in reclaimed async connection %r"
+                    % (raw_connection,),
+                    exc_info=True,
+                )
+                return
+        elif record.in_use:
+            record.checkin()
+
+        with self._lease_lock:
+            self._leases.pop(record, None)
+            record._lease = None
+            lease.reclaimed = True
+            self._record_lease_history(lease, record, "reclaimed")
 
 
 class ManagesConnection:
@@ -651,6 +1394,8 @@ class _ConnectionRecord(ConnectionPoolEntry):
         "fresh",
         "starttime",
         "dbapi_connection",
+        "_lease",
+        "_lease_invalid_on_return",
         "__weakref__",
         "__dict__",
     )
@@ -659,12 +1404,16 @@ class _ConnectionRecord(ConnectionPoolEntry):
     fresh: bool
     fairy_ref: Optional[weakref.ref[_ConnectionFairy]]
     starttime: float
+    _lease: Optional[_Lease]
+    _lease_invalid_on_return: bool
 
     def __init__(self, pool: Pool, connect: bool = True):
         self.fresh = False
         self.fairy_ref = None
         self.starttime = 0
         self.dbapi_connection = None
+        self._lease = None
+        self._lease_invalid_on_return = False
 
         self.__pool = pool
         if connect:
@@ -763,6 +1512,11 @@ class _ConnectionRecord(ConnectionPoolEntry):
         self.fairy_ref = None
         connection = self.dbapi_connection
         pool = self.__pool
+
+        # close out the checkout lease (idempotent), consuming any
+        # pending invalid-on-return flag before the record is reused
+        pool._lease_end(self)
+
         while self.finalize_callback:
             finalizer = self.finalize_callback.pop()
             if connection is not None:
@@ -1003,26 +1757,51 @@ def _finalize_fairy(
                 )
             assert fairy.dbapi_connection is dbapi_connection
 
-            fairy._reset(
-                pool,
-                transaction_was_reset=transaction_was_reset,
-                terminate_only=detach,
-                asyncio_safe=can_manipulate_connection,
+            # a lease that expired with the "invalidate" disposition
+            # marks this connection as suspect; it must not be reset
+            # (the borrower may have been stuck on exactly that call) or
+            # returned to the idle pool - terminate/recycle it instead.
+            lease_invalidated = can_manipulate_connection and (
+                fairy._lease_invalidated
+                or (
+                    connection_record is not None
+                    and connection_record._lease_invalid_on_return
+                )
             )
 
-            if detach:
-                if connection_record:
-                    fairy._pool = pool
-                    fairy.detach()
-
-                if can_close_or_terminate_connection:
-                    if pool.dispatch.close_detached:
-                        pool.dispatch.close_detached(dbapi_connection)
-
-                    pool._close_connection(
-                        dbapi_connection,
-                        terminate=requires_terminate_for_close,
+            if lease_invalidated:
+                assert connection_record is not None
+                connection_record.invalidate(
+                    e=exc.LeaseExpiredError(
+                        "Connection %r is being returned to the pool "
+                        "after its checkout lease expired with "
+                        'lease_on_expire="invalidate"; the connection '
+                        "is being recycled" % (dbapi_connection,)
                     )
+                )
+                fairy.dbapi_connection = None  # type: ignore[assignment]
+                dbapi_connection = None
+            else:
+                fairy._reset(
+                    pool,
+                    transaction_was_reset=transaction_was_reset,
+                    terminate_only=detach,
+                    asyncio_safe=can_manipulate_connection,
+                )
+
+                if detach:
+                    if connection_record:
+                        fairy._pool = pool
+                        fairy.detach()
+
+                    if can_close_or_terminate_connection:
+                        if pool.dispatch.close_detached:
+                            pool.dispatch.close_detached(dbapi_connection)
+
+                        pool._close_connection(
+                            dbapi_connection,
+                            terminate=requires_terminate_for_close,
+                        )
 
         except BaseException as e:
             pool.logger.error(
@@ -1242,6 +2021,8 @@ class _ConnectionFairy(PoolProxiedConnection):
         "_echo",
         "_pool",
         "_counter",
+        "_reclaimed_exc",
+        "_lease_invalidated",
         "__weakref__",
         "__dict__",
     )
@@ -1249,6 +2030,8 @@ class _ConnectionFairy(PoolProxiedConnection):
     pool: Pool
     dbapi_connection: DBAPIConnection
     _echo: log._EchoFlagType
+    _reclaimed_exc: Optional[BaseException]
+    _lease_invalidated: bool
 
     def __init__(
         self,
@@ -1262,6 +2045,8 @@ class _ConnectionFairy(PoolProxiedConnection):
         self.dbapi_connection = dbapi_connection
         self._connection_record = connection_record
         self._echo = echo
+        self._reclaimed_exc = None
+        self._lease_invalidated = False
 
         # use weakref.finalize as a destructor
         self._finalizer = weakref.finalize(
@@ -1316,6 +2101,13 @@ class _ConnectionFairy(PoolProxiedConnection):
         if (
             not pool.dispatch.checkout and not pool._pre_ping
         ) or fairy._counter != 1:
+            if fairy._counter == 1:
+                # the lease starts only once the connection is fully
+                # ready to hand to the borrower (pre-ping / checkout
+                # events above would otherwise consume lease time);
+                # nested re-checkouts keep the original lease
+                assert fairy._connection_record is not None
+                pool._lease_begin(fairy._connection_record, fairy)
             return fairy
 
         # Pool listeners can trigger a reconnection on checkout, as well
@@ -1357,6 +2149,7 @@ class _ConnectionFairy(PoolProxiedConnection):
                 pool.dispatch.checkout(
                     fairy.dbapi_connection, fairy._connection_record, fairy
                 )
+                pool._lease_begin(fairy._connection_record, fairy)
                 return fairy
             except exc.DisconnectionError as e:
                 if e.invalidate_pool:
@@ -1483,7 +2276,9 @@ class _ConnectionFairy(PoolProxiedConnection):
 
     @property
     def is_valid(self) -> bool:
-        return self.dbapi_connection is not None
+        return (
+            self.dbapi_connection is not None and self._reclaimed_exc is None
+        )
 
     @property
     def is_detached(self) -> bool:
@@ -1506,6 +2301,10 @@ class _ConnectionFairy(PoolProxiedConnection):
     def invalidate(
         self, e: Optional[BaseException] = None, soft: bool = False
     ) -> None:
+        if self._reclaimed_exc is not None:
+            # the pool already took this connection back; there is nothing
+            # left for the borrower to invalidate
+            return
         if self.dbapi_connection is None:
             util.warn("Can't invalidate an already-closed connection.")
             return
@@ -1520,13 +2319,23 @@ class _ConnectionFairy(PoolProxiedConnection):
             self._checkin()
 
     def cursor(self, *args: Any, **kwargs: Any) -> DBAPICursor:
+        if self._reclaimed_exc is not None:
+            raise self._reclaimed_exc
         assert self.dbapi_connection is not None
         return self.dbapi_connection.cursor(*args, **kwargs)
 
     def __getattr__(self, key: str) -> Any:
+        # note: this is only invoked when normal attribute lookup fails,
+        # so _reclaimed_exc itself (a real slot attribute) does not recurse
+        reclaimed_exc = self._reclaimed_exc
+        if reclaimed_exc is not None:
+            raise reclaimed_exc
         return getattr(self.dbapi_connection, key)
 
     def detach(self) -> None:
+        if self._reclaimed_exc is not None:
+            # a reclaimed handle cannot be detached by the former borrower
+            return
         if self._connection_record is not None:
             rec = self._connection_record
             rec.fairy_ref = None
@@ -1537,6 +2346,7 @@ class _ConnectionFairy(PoolProxiedConnection):
             self._finalizer.detach()
 
             rec.dbapi_connection = None
+            self._pool._lease_end(rec)
             # TODO: should this be _return_conn?
             self._pool._do_return_conn(self._connection_record)
 
@@ -1550,11 +2360,18 @@ class _ConnectionFairy(PoolProxiedConnection):
                 self._pool.dispatch.detach(self.dbapi_connection, rec)
 
     def close(self) -> None:
+        if self._reclaimed_exc is not None:
+            # the pool already checked this connection in on our behalf;
+            # the borrower's close() is a no-op so the record can't be
+            # returned twice
+            return
         self._counter -= 1
         if self._counter == 0:
             self._checkin()
 
     def _close_special(self, transaction_reset: bool = False) -> None:
+        if self._reclaimed_exc is not None:
+            return
         self._counter -= 1
         if self._counter == 0:
             self._checkin(transaction_was_reset=transaction_reset)

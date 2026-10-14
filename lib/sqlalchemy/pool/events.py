@@ -13,6 +13,7 @@ from typing import Type
 from typing import Union
 
 from .base import ConnectionPoolEntry
+from .base import LeaseStatus
 from .base import Pool
 from .base import PoolProxiedConnection
 from .base import PoolResetState
@@ -192,6 +193,46 @@ class PoolEvents(event.Events[Pool]):
 
         :param connection_record: the :class:`.ConnectionPoolEntry` managing
          the DBAPI connection.
+
+        """
+
+    def lease_expired(
+        self,
+        dbapi_connection: Optional[DBAPIConnection],
+        connection_record: ConnectionPoolEntry,
+        lease: LeaseStatus,
+    ) -> None:
+        """Called once when a checked-out connection exceeds its configured
+        ``lease_time``.
+
+        The event fires at the moment expiry is first detected (by the
+        background reaper thread or an opportunistic checkout-time scan),
+        exactly once per checked-out lease.  It fires for all values of
+        the pool's ``lease_on_expire`` setting (``"log"``,
+        ``"reclaim"`` or ``"invalidate"``), before the configured
+        disposition is applied.
+
+        :param dbapi_connection: a DBAPI connection.
+         The :attr:`.ConnectionPoolEntry.dbapi_connection` attribute. May
+         be ``None`` if the connection was already reclaimed.
+
+        :param connection_record: the :class:`.ConnectionPoolEntry` managing
+         the DBAPI connection.
+
+        :param lease: a :class:`.LeaseStatus` snapshot describing the
+         expired lease, including the occupancy time (``age``), the
+         configured limit (``lease_time``), the checkout source
+         (``source`` and ``traceback``) and the checking-out thread.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :paramref:`_pool.Pool.lease_time`
+
+            :paramref:`_pool.Pool.lease_on_expire`
+
+            :meth:`_pool.Pool.expired_leases`
 
         """
 

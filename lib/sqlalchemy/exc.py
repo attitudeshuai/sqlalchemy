@@ -375,6 +375,24 @@ class ResourceClosedError(InvalidRequestError):
     object that's in a closed state."""
 
 
+class LeaseExpiredError(InvalidRequestError):
+    """An operation was attempted against a pooled connection whose
+    checkout lease expired and which was forcefully reclaimed by the
+    connection pool.
+
+    When the pool is configured with ``lease_on_expire="reclaim"``, a
+    connection held longer than the configured ``lease_time`` is taken
+    back by the pool.  The connection handle still held by the original
+    borrower is invalidated; any subsequent read, write or other operation
+    on that handle raises :class:`_exc.LeaseExpiredError` rather than
+    silently affecting a connection that has already been returned to the
+    pool and possibly handed to another borrower.
+
+    .. versionadded:: 2.1
+
+    """
+
+
 class NoSuchColumnError(InvalidRequestError, KeyError):
     """A nonexistent column is requested from a ``Row``."""
 

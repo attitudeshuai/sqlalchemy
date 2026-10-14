@@ -211,11 +211,15 @@ class QueuePool(Pool):
             echo=self.echo,
             logging_name=self._orig_logging_name,
             reset_on_return=self._reset_on_return,
+            lease_time=self._lease_time,
+            lease_on_expire=self._lease_on_expire,
+            lease_reap_interval=self._lease_reap_interval,
             _dispatch=self.dispatch,
             dialect=self._dialect,
         )
 
     def dispose(self) -> None:
+        self._stop_reaper()
         while True:
             try:
                 conn = self._pool.get(False)
@@ -227,7 +231,7 @@ class QueuePool(Pool):
         self.logger.info("Pool disposed. %s", self.status())
 
     def status(self) -> str:
-        return (
+        text = (
             "Pool size: %d  Connections in pool: %d "
             "Current Overflow: %d Current Checked out "
             "connections: %d"
@@ -238,6 +242,12 @@ class QueuePool(Pool):
                 self.checkedout(),
             )
         )
+        leases = self.checked_out_leases()
+        if leases:
+            text += "\n" + "\n".join(
+                "  %s" % lease.status_line() for lease in leases
+            )
+        return text
 
     def size(self) -> int:
         return self._pool.maxsize
@@ -310,12 +320,15 @@ class NullPool(Pool):
             logging_name=self._orig_logging_name,
             reset_on_return=self._reset_on_return,
             pre_ping=self._pre_ping,
+            lease_time=self._lease_time,
+            lease_on_expire=self._lease_on_expire,
+            lease_reap_interval=self._lease_reap_interval,
             _dispatch=self.dispatch,
             dialect=self._dialect,
         )
 
     def dispose(self) -> None:
-        pass
+        self._stop_reaper()
 
 
 class SingletonThreadPool(Pool):
@@ -375,6 +388,9 @@ class SingletonThreadPool(Pool):
             pre_ping=self._pre_ping,
             logging_name=self._orig_logging_name,
             reset_on_return=self._reset_on_return,
+            lease_time=self._lease_time,
+            lease_on_expire=self._lease_on_expire,
+            lease_reap_interval=self._lease_reap_interval,
             _dispatch=self.dispatch,
             dialect=self._dialect,
         )
@@ -391,6 +407,7 @@ class SingletonThreadPool(Pool):
     def dispose(self) -> None:
         """Dispose of this pool."""
 
+        self._stop_reaper()
         for conn in self._all_conns:
             try:
                 conn.close()
@@ -469,6 +486,7 @@ class StaticPool(Pool):
         return "StaticPool"
 
     def dispose(self) -> None:
+        self._stop_reaper()
         if (
             "connection" in self.__dict__
             and self.connection.dbapi_connection is not None
@@ -483,6 +501,9 @@ class StaticPool(Pool):
             recycle=self._recycle,
             reset_on_return=self._reset_on_return,
             pre_ping=self._pre_ping,
+            lease_time=self._lease_time,
+            lease_on_expire=self._lease_on_expire,
+            lease_reap_interval=self._lease_reap_interval,
             echo=self.echo,
             logging_name=self._orig_logging_name,
             _dispatch=self.dispatch,
@@ -547,6 +568,7 @@ class AssertionPool(Pool):
         assert record is self._conn
 
     def dispose(self) -> None:
+        self._stop_reaper()
         self._checked_out = False
         if self._conn:
             self._conn.close()
@@ -559,6 +581,9 @@ class AssertionPool(Pool):
             pre_ping=self._pre_ping,
             recycle=self._recycle,
             reset_on_return=self._reset_on_return,
+            lease_time=self._lease_time,
+            lease_on_expire=self._lease_on_expire,
+            lease_reap_interval=self._lease_reap_interval,
             logging_name=self._orig_logging_name,
             _dispatch=self.dispatch,
             dialect=self._dialect,

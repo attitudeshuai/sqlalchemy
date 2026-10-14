@@ -47,6 +47,8 @@ from .engine import URL as URL
 from .inspection import inspect as inspect
 from .pool import AssertionPool as AssertionPool
 from .pool import AsyncAdaptedQueuePool as AsyncAdaptedQueuePool
+from .pool import LeaseAction as LeaseAction
+from .pool import LeaseStatus as LeaseStatus
 from .pool import NullPool as NullPool
 from .pool import Pool as Pool
 from .pool import PoolProxiedConnection as PoolProxiedConnection

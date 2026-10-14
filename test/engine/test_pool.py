@@ -11,6 +11,8 @@ import weakref
 import sqlalchemy as tsa
 from sqlalchemy import create_engine
 from sqlalchemy import event
+from sqlalchemy import LeaseAction
+from sqlalchemy import LeaseStatus
 from sqlalchemy import pool
 from sqlalchemy import PoolResetState
 from sqlalchemy import select
@@ -290,6 +292,7 @@ class PoolTest(PoolTestBase):
             "_overflow_lock",
             "_fairy",
             "_conn",
+            "_lease_lock",
             "logger",
         ):
             if k in d2:
@@ -2410,3 +2413,461 @@ class CreatorCompatibilityTest(PoolTestBase):
 
         conn = e.connect()
         conn.close()
+
+
+class LeaseTest(PoolTestBase):
+    """Tests for checkout lease governance."""
+
+    def _leased_pool(self, **kw):
+        kw.setdefault("pool_size", 1)
+        kw.setdefault("max_overflow", 0)
+        kw.setdefault("lease_time", 0.05)
+        kw.setdefault("lease_on_expire", "log")
+        return self._queuepool_dbapi_fixture(**kw)
+
+    def test_disabled_by_default(self):
+        dbapi = MockDBAPI()
+        p = pool.QueuePool(creator=dbapi.connect, pool_size=1, max_overflow=0)
+        try:
+            is_(p._lease_enabled, False)
+            eq_(p.checked_out_leases(), [])
+            eq_(p.expired_leases(), [])
+            is_none(p._reaper)
+
+            c = p.connect()
+            eq_(
+                p.status(),
+                "Pool size: 1  Connections in pool: 0 "
+                "Current Overflow: 0 Current Checked out connections: 1",
+            )
+            eq_(p.checked_out_leases(), [])
+            c.close()
+            eq_(
+                p.status(),
+                "Pool size: 1  Connections in pool: 1 "
+                "Current Overflow: 0 Current Checked out connections: 0",
+            )
+        finally:
+            p.dispose()
+
+    def test_invalid_lease_arguments(self):
+        with expect_raises_message(tsa.exc.ArgumentError, "lease_time"):
+            pool.QueuePool(creator=Mock(), lease_time=-2)
+
+        with expect_raises_message(tsa.exc.ArgumentError, "lease_on_expire"):
+            pool.QueuePool(creator=Mock(), lease_time=10, lease_on_expire="x")
+
+    def test_lease_tracking_and_status(self):
+        dbapi, p = self._leased_pool(lease_time=10)
+        try:
+            c = p.connect()
+            leases = p.checked_out_leases()
+            eq_(len(leases), 1)
+            lease = leases[0]
+            assert isinstance(lease, LeaseStatus)
+            eq_(lease.lease_time, 10.0)
+            assert lease.age >= 0
+            assert not lease.expired
+            eq_(lease.state, "active")
+            eq_(lease.thread_ident, threading.get_ident())
+            is_(lease.dbapi_connection, c.dbapi_connection)
+            is_(lease.connection_record, c._connection_record)
+            # source points at the most recent non-SQLAlchemy caller,
+            # which is this test method
+            assert "test_pool.py" in lease.source
+            assert "test_lease_tracking_and_status" in lease.source
+            assert "test_pool.py" in lease.traceback
+            assert (
+                abs((lease.expires_at - lease.checked_out_at) - 10.0) < 0.001
+            )
+
+            status = p.status()
+            assert "Lease age=" in status
+            assert "limit=10.00s" in status
+            assert "state=active" in status
+            assert "test_lease_tracking_and_status" in status
+
+            c.close()
+            eq_(p.checked_out_leases(), [])
+            # no expired lease, so no lease line and no history
+            assert "Lease" not in p.status()
+            eq_(p.expired_leases(), [])
+        finally:
+            p.dispose()
+
+    def test_lease_ends_on_detach(self):
+        dbapi, p = self._leased_pool(lease_time=10)
+        try:
+            c = p.connect()
+            eq_(len(p.checked_out_leases()), 1)
+            c.detach()
+            eq_(p.checked_out_leases(), [])
+        finally:
+            p.dispose()
+
+    def test_expired_log_event_fires_once(self):
+        dbapi, p = self._leased_pool(lease_time=0.05, lease_on_expire="log")
+        received = []
+
+        def listener(dbapi_connection, record, lease_status):
+            received.append((dbapi_connection, record, lease_status))
+
+        event.listen(p, "lease_expired", listener)
+        try:
+            c = p.connect()
+            raw = c.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+            # a second pass must not re-fire or duplicate the entry
+            p.reap_expired_leases()
+
+            eq_(len(received), 1)
+            dbapi_conn, record, lease_status = received[0]
+            is_(dbapi_conn, raw)
+            is_(record, c._connection_record)
+            assert lease_status.expired
+            eq_(lease_status.state, "expired")
+            assert lease_status.age >= 0.05
+
+            # log policy: borrower keeps a fully usable connection
+            is_true(c.is_valid)
+            is_(c.dbapi_connection, raw)
+            eq_(p.checkedout(), 1)
+
+            expired = p.expired_leases()
+            eq_(len(expired), 1)
+            eq_(expired[0].state, "expired")
+
+            c.close()
+            # audit list keeps the final resolution
+            eq_(p.expired_leases()[-1].state, "returned")
+            eq_(p.checkedout(), 0)
+        finally:
+            p.dispose()
+
+    def test_expired_detection_at_checkout(self):
+        # two pool slots; with the background reaper effectively idle,
+        # the next checkout performs the enforcement opportunistically
+        dbapi, p = self._leased_pool(
+            pool_size=2,
+            max_overflow=1,
+            lease_time=0.05,
+            lease_reap_interval=300,
+        )
+        fired = threading.Event()
+        event.listen(p, "lease_expired", lambda *a: fired.set())
+        try:
+            c1 = p.connect()
+            time.sleep(0.1)
+            assert not fired.is_set()
+            c2 = p.connect()
+            assert fired.wait(join_timeout)
+            c2.close()
+            c1.close()
+            eq_(p.expired_leases()[-1].state, "returned")
+        finally:
+            p.dispose()
+
+    def test_invalidate_on_return(self):
+        dbapi, p = self._leased_pool(
+            lease_time=0.05, lease_on_expire="invalidate"
+        )
+        try:
+            c1 = p.connect()
+            raw = c1.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+
+            lease = p.checked_out_leases()[0]
+            eq_(lease.state, "invalidated")
+            is_true(c1._lease_invalidated)
+
+            # still usable while held, but it will be discarded at close
+            is_true(c1.is_valid)
+            raw.rollback.reset_mock()
+
+            c1.close()
+
+            # the suspect connection must be terminated, not reset and
+            # not returned to the idle pool
+            is_true(raw.close.called)
+            assert not raw.rollback.called
+            eq_(p.checkedout(), 0)
+            eq_(p.checkedin(), 1)
+
+            # the next borrower receives a brand new connection
+            c2 = p.connect()
+            is_not(c2.dbapi_connection, raw)
+            c2.close()
+
+            eq_(p.expired_leases()[-1].state, "returned")
+        finally:
+            p.dispose()
+
+    def test_invalidate_on_return_via_gc(self):
+        dbapi, p = self._leased_pool(
+            lease_time=0.05, lease_on_expire="invalidate"
+        )
+        try:
+            c1 = p.connect()
+            raw = c1.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+
+            del c1
+            gc_collect()
+
+            is_true(raw.close.called)
+            eq_(p.checkedout(), 0)
+        finally:
+            p.dispose()
+
+    def test_reclaim_raises_on_further_use(self):
+        dbapi, p = self._leased_pool(
+            lease_time=0.05, lease_on_expire="reclaim"
+        )
+        try:
+            c1 = p.connect()
+            raw = c1.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+
+            # every remaining operation on the stale handle fails
+            # explicitly instead of writing into a reclaimed connection
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.cursor()
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.commit()
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.rollback()
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.execute("select 1")
+            assert not c1.is_valid
+
+            # closing the stale handle is a harmless no-op and can't
+            # double-return the record
+            c1.close()
+            c1.close()
+
+            # capacity was released and the raw connection was terminated
+            eq_(p.checkedout(), 0)
+            is_true(raw.close.called)
+            eq_(p.expired_leases()[-1].state, "reclaimed")
+        finally:
+            p.dispose()
+
+    def test_reclaim_next_borrower_gets_new_connection(self):
+        dbapi, p = self._leased_pool(
+            lease_time=0.05, lease_on_expire="reclaim"
+        )
+        try:
+            c1 = p.connect()
+            raw1 = c1.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+
+            c2 = p.connect()
+            is_not(c2.dbapi_connection, raw1)
+            c2.close()
+        finally:
+            p.dispose()
+
+    @testing.requires.threading_with_mock
+    def test_reclaim_unblocks_waiting_borrower(self):
+        dbapi, p = self._leased_pool(
+            pool_size=1,
+            max_overflow=0,
+            timeout=10,
+            lease_time=0.05,
+            lease_on_expire="reclaim",
+            lease_reap_interval=300,
+        )
+        try:
+            c1 = p.connect()  # noqa
+            held = []
+            got = []
+            errors = []
+
+            def waiter():
+                try:
+                    # keep the fairy referenced so its GC finalizer
+                    # doesn't check it back in early
+                    conn = p.connect()
+                    held.append(conn)
+                    got.append(conn.dbapi_connection)
+                except BaseException as e:
+                    errors.append(e)
+
+            t = threading.Thread(target=waiter)
+            t.daemon = True
+            t.start()
+
+            # the only slot is held by c1, so the waiter blocks in the
+            # queue and stays blocked with the reaper thread idle
+            time.sleep(0.2)
+            eq_(got, [])
+            eq_(p.checkedout(), 1)
+
+            # a manual enforcement pass reclaims the expired lease and
+            # hands its slot to the waiting borrower
+            p.reap_expired_leases()
+            t.join(join_timeout)
+            assert not t.is_alive()
+
+            eq_(errors, [])
+            eq_(len(got), 1)
+            is_not(got[0], c1.dbapi_connection)
+            eq_(p.checkedout(), 1)
+        finally:
+            p.dispose()
+
+    @testing.requires.threading_with_mock
+    @testing.requires.timing_intensive
+    def test_background_reaper_enforces(self):
+        for action, freed in (
+            ("log", False),
+            ("reclaim", True),
+        ):
+            dbapi, p = self._leased_pool(
+                pool_size=1,
+                max_overflow=0,
+                lease_time=0.1,
+                lease_on_expire=action,
+                lease_reap_interval=0.02,
+            )
+            fired = threading.Event()
+            event.listen(p, "lease_expired", lambda *a: fired.set())
+            try:
+                c1 = p.connect()  # noqa
+                assert fired.wait(join_timeout)
+                deadline = time.time() + join_timeout
+                while freed and p.checkedout() != 0:
+                    if time.time() >= deadline:
+                        break
+                    time.sleep(0.02)
+                if freed:
+                    eq_(p.checkedout(), 0)
+                    with expect_raises(tsa.exc.LeaseExpiredError):
+                        c1.cursor()
+                else:
+                    eq_(p.checkedout(), 1)
+                eq_(len(p.expired_leases()), 1)
+            finally:
+                p.dispose()
+
+    def test_event_listener_exception_does_not_stop_enforcement(self):
+        dbapi, p = self._leased_pool(
+            lease_time=0.05, lease_on_expire="reclaim"
+        )
+
+        def boom(*a):
+            raise RuntimeError("listener boom")
+
+        event.listen(p, "lease_expired", boom)
+        try:
+            c1 = p.connect()
+            time.sleep(0.1)
+            p.reap_expired_leases()  # must not raise
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.cursor()
+        finally:
+            p.dispose()
+
+    def test_wait_timeout_unaffected_by_lease(self):
+        dbapi, p = self._leased_pool(
+            pool_size=1,
+            max_overflow=0,
+            timeout=0.05,
+            lease_time=10,
+            lease_on_expire="reclaim",
+        )
+        try:
+            c1 = p.connect()  # noqa
+            with expect_raises_message(
+                tsa.exc.TimeoutError, "QueuePool limit"
+            ):
+                p.connect()
+            # the failed wait created no lease and counts are intact
+            eq_(p.checkedout(), 1)
+            eq_(len(p.checked_out_leases()), 1)
+        finally:
+            p.dispose()
+
+    @testing.combinations(
+        (pool.QueuePool, True),
+        (pool.NullPool, False),
+        (pool.StaticPool, False),
+        (pool.AssertionPool, False),
+        argnames="pool_cls,has_capacity",
+    )
+    def test_tracking_other_pool_classes(self, pool_cls, has_capacity):
+        dbapi = MockDBAPI()
+        p = pool_cls(creator=dbapi.connect, lease_time=10)
+        try:
+            c = p.connect()
+            leases = p.checked_out_leases()
+            eq_(len(leases), 1)
+            eq_(leases[0].state, "active")
+            c.close()
+            eq_(p.checked_out_leases(), [])
+        finally:
+            p.dispose()
+
+    def test_static_pool_reclaim(self):
+        dbapi = MockDBAPI()
+        p = pool.StaticPool(
+            creator=dbapi.connect,
+            lease_time=0.05,
+            lease_on_expire="reclaim",
+        )
+        try:
+            c1 = p.connect()
+            raw1 = c1.dbapi_connection
+            time.sleep(0.1)
+            p.reap_expired_leases()
+            with expect_raises(tsa.exc.LeaseExpiredError):
+                c1.cursor()
+            c2 = p.connect()
+            is_not(c2.dbapi_connection, raw1)
+            c2.close()
+        finally:
+            p.dispose()
+
+    def test_create_engine_lease_kwargs_and_recreate(self):
+        e = create_engine(
+            "sqlite://",
+            pool_lease_time=10,
+            pool_lease_on_expire="reclaim",
+        )
+        try:
+            is_(e.pool._lease_on_expire, LeaseAction.reclaim)
+            eq_(e.pool._lease_time, 10.0)
+
+            with e.begin() as conn:
+                conn.exec_driver_sql("select 1")
+            eq_(e.pool.checked_out_leases(), [])
+
+            old_pool = e.pool
+            reaper = old_pool._reaper
+            is_not_none(reaper)
+            assert reaper.is_alive()
+
+            e.dispose()
+            is_not(e.pool, old_pool)
+            is_none(old_pool._reaper)
+            assert not reaper.is_alive()
+            # recreate preserves the lease configuration
+            eq_(e.pool._lease_time, 10.0)
+            is_(e.pool._lease_on_expire, LeaseAction.reclaim)
+        finally:
+            e.dispose()
+
+    def test_pre_ping_coexists_with_lease(self):
+        e = create_engine("sqlite://", pool_pre_ping=True, pool_lease_time=10)
+        try:
+            for i in range(2):
+                with e.connect() as conn:
+                    eq_(conn.exec_driver_sql("select 1").scalar(), 1)
+                eq_(e.pool.checked_out_leases(), [])
+        finally:
+            e.dispose()
