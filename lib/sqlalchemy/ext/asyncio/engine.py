@@ -1465,6 +1465,7 @@ def _get_sync_engine_or_connection(
 @inspection._inspects(AsyncConnection)
 def _no_insp_for_async_conn_yet(
     subject: AsyncConnection,  # noqa: U100
+    **kwargs: Any,  # noqa: U100, ARG001
 ) -> NoReturn:
     raise exc.NoInspectionAvailable(
         "Inspection on an AsyncConnection is currently not supported. "
@@ -1477,6 +1478,7 @@ def _no_insp_for_async_conn_yet(
 @inspection._inspects(AsyncEngine)
 def _no_insp_for_async_engine_xyet(
     subject: AsyncEngine,  # noqa: U100
+    **kwargs: Any,  # noqa: U100, ARG001
 ) -> NoReturn:
     raise exc.NoInspectionAvailable(
         "Inspection on an AsyncEngine is currently not supported. "

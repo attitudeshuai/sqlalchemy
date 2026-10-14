@@ -27,16 +27,20 @@ methods such as get_table_names, get_columns, etc.
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 import contextlib
 from dataclasses import dataclass
+from dataclasses import field
 from enum import auto
 from enum import Flag
 from enum import unique
+import threading
 from typing import Any
 from typing import Callable
 from typing import Collection
 from typing import Dict
 from typing import final
+from typing import FrozenSet
 from typing import Generator
 from typing import Iterable
 from typing import List
@@ -105,7 +109,12 @@ def cache(
     ret: _R = info_cache.get(key)
     if ret is None:
         ret = fn(self, con, *args, **kw)
-        info_cache[key] = ret
+        _store_cached_entry(
+            info_cache,
+            key,
+            ret,
+            _tag_for_cache_method(fn.__name__, args, kw),
+        )
     return ret
 
 
@@ -127,7 +136,12 @@ def flexi_cache(
         ret: _R = info_cache.get(key)
         if ret is None:
             ret = fn(self, con, *args, **kw)
-            info_cache[key] = ret
+            _store_cached_entry(
+                info_cache,
+                key,
+                ret,
+                _tag_for_flexi_cache_method(fn.__name__, traverse_args, args),
+            )
         return ret
 
     return go
@@ -179,6 +193,749 @@ class ObjectScope(Flag):
     "Include both default and temp scope"
 
 
+@unique
+class ReflectionCategory(Flag):
+    """Enumerator of the categories of information that reflection methods
+    can cache.
+
+    The enum is a :class:`~enum.Flag`, so custom combinations can be passed
+    to :meth:`.ReflectionCache.invalidate` and
+    :meth:`_reflection.Inspector.invalidate_cache`, for example
+    ``ReflectionCategory.COLUMNS | ReflectionCategory.INDEXES``.
+
+    .. versionadded:: 2.1
+
+    """
+
+    COLUMNS = auto()
+    "Cached column information"
+    PRIMARY_KEY = auto()
+    "Cached primary key constraint information"
+    FOREIGN_KEYS = auto()
+    "Cached foreign key constraint information"
+    INDEXES = auto()
+    "Cached index information"
+    UNIQUE_CONSTRAINTS = auto()
+    "Cached unique constraint information"
+    CHECK_CONSTRAINTS = auto()
+    "Cached check constraint information"
+    TABLE_COMMENT = auto()
+    "Cached table comment information"
+    TABLE_OPTIONS = auto()
+    "Cached table options information"
+    VIEW_DEFINITION = auto()
+    "Cached view definitions"
+    EXISTENCE = auto()
+    "Cached table/schema/sequence existence checks"
+    LISTING = auto()
+    "Cached name listings and whole-schema batch reflection data"
+
+    ALL = (
+        COLUMNS
+        | PRIMARY_KEY
+        | FOREIGN_KEYS
+        | INDEXES
+        | UNIQUE_CONSTRAINTS
+        | CHECK_CONSTRAINTS
+        | TABLE_COMMENT
+        | TABLE_OPTIONS
+        | VIEW_DEFINITION
+        | EXISTENCE
+        | LISTING
+    )
+    "All reflection categories"
+
+
+# maps the dialect reflection method names that may appear as the first
+# element of an info_cache key to the categories of information they carry.
+# Method names not present here (including third party dialect specific
+# ones) are conservatively treated as ReflectionCategory.ALL.
+_REFLECTION_METHOD_CATEGORIES: Dict[str, ReflectionCategory] = {
+    # per-table families
+    "get_columns": ReflectionCategory.COLUMNS,
+    "get_pk_constraint": ReflectionCategory.PRIMARY_KEY,
+    "get_foreign_keys": ReflectionCategory.FOREIGN_KEYS,
+    "get_indexes": ReflectionCategory.INDEXES,
+    "get_unique_constraints": ReflectionCategory.UNIQUE_CONSTRAINTS,
+    "get_check_constraints": ReflectionCategory.CHECK_CONSTRAINTS,
+    "get_table_comment": ReflectionCategory.TABLE_COMMENT,
+    "get_table_options": ReflectionCategory.TABLE_OPTIONS,
+    "get_view_definition": ReflectionCategory.VIEW_DEFINITION,
+    # existence checks
+    "has_table": ReflectionCategory.EXISTENCE,
+    "has_index": ReflectionCategory.EXISTENCE,
+    "has_sequence": ReflectionCategory.EXISTENCE,
+    "has_schema": ReflectionCategory.EXISTENCE,
+    "has_type": ReflectionCategory.EXISTENCE,
+    "get_table_oid": ReflectionCategory.EXISTENCE,
+    # listings
+    "get_schema_names": ReflectionCategory.LISTING,
+    "get_table_names": ReflectionCategory.LISTING,
+    "get_temp_table_names": ReflectionCategory.LISTING,
+    "get_temp_view_names": ReflectionCategory.LISTING,
+    "get_view_names": ReflectionCategory.LISTING,
+    "get_materialized_view_names": ReflectionCategory.LISTING,
+    "get_sequence_names": ReflectionCategory.LISTING,
+    "_get_foreign_table_names": ReflectionCategory.LISTING,
+    # native multi table reflection batch loaders
+    "_get_table_oids": ReflectionCategory.LISTING,
+    "_get_all_objects": ReflectionCategory.LISTING,
+    "_get_synonyms": ReflectionCategory.LISTING,
+    "_load_enums": ReflectionCategory.LISTING,
+    "_load_domains": ReflectionCategory.LISTING,
+    "_get_indexes_rows": ReflectionCategory.INDEXES,
+    "_get_all_constraint_rows": (
+        ReflectionCategory.PRIMARY_KEY
+        | ReflectionCategory.FOREIGN_KEYS
+        | ReflectionCategory.UNIQUE_CONSTRAINTS
+        | ReflectionCategory.CHECK_CONSTRAINTS
+    ),
+    # dialect specific loaders that carry several per-table families at once
+    "_get_table_sql": (
+        ReflectionCategory.COLUMNS
+        | ReflectionCategory.PRIMARY_KEY
+        | ReflectionCategory.FOREIGN_KEYS
+        | ReflectionCategory.INDEXES
+        | ReflectionCategory.UNIQUE_CONSTRAINTS
+        | ReflectionCategory.CHECK_CONSTRAINTS
+        | ReflectionCategory.TABLE_OPTIONS
+        | ReflectionCategory.TABLE_COMMENT
+    ),
+    "_setup_parser": (
+        ReflectionCategory.COLUMNS
+        | ReflectionCategory.PRIMARY_KEY
+        | ReflectionCategory.FOREIGN_KEYS
+        | ReflectionCategory.INDEXES
+        | ReflectionCategory.UNIQUE_CONSTRAINTS
+        | ReflectionCategory.CHECK_CONSTRAINTS
+        | ReflectionCategory.TABLE_OPTIONS
+        | ReflectionCategory.TABLE_COMMENT
+    ),
+}
+
+
+@dataclass(frozen=True)
+class _CacheEntryTag:
+    """Locations and categories of the information held by a cache entry."""
+
+    method: str
+    categories: ReflectionCategory
+    schema: Optional[str]
+    # ``None`` means the entry covers a whole schema (listings and batch
+    # reflection with no name filter); an empty frozenset means the entry is
+    # global and not related to any schema; otherwise the entry is tied to
+    # exactly the named tables/views/sequences.
+    names: Optional[FrozenSet[str]]
+
+
+# sentinel used to distinguish "schema not specified" from
+# "schema specified as the default schema (None)" in invalidate()
+_UNSET: Any = object()
+
+
+def _plain_cache_key_string(value: Any) -> Optional[str]:
+    # ``@cache`` encodes quoted_name arguments as ``(str, quote)`` tuples
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], str)
+    ):
+        return value[0]
+    elif isinstance(value, str):
+        return str(value)
+    else:
+        return None
+
+
+def _tag_for_cache_method(
+    method: str, args: Tuple[Any, ...], kw: Dict[str, Any]
+) -> _CacheEntryTag:
+    categories = _REFLECTION_METHOD_CATEGORIES.get(
+        method, ReflectionCategory.ALL
+    )
+    name: Optional[str] = None
+    for arg in args:
+        if isinstance(arg, str):
+            name = str(arg)
+            break
+
+    if name is not None:
+        schema_arg = kw.get("schema")
+        schema = None if schema_arg is None else str(schema_arg)
+        return _CacheEntryTag(method, categories, schema, frozenset({name}))
+    elif "schema" in kw:
+        schema_arg = kw["schema"]
+        schema = None if schema_arg is None else str(schema_arg)
+        # whole-schema entry, e.g. get_table_names(schema=...)
+        return _CacheEntryTag(method, categories, schema, None)
+    else:
+        # global entry, e.g. get_schema_names()
+        return _CacheEntryTag(method, categories, None, frozenset())
+
+
+def _tag_for_flexi_cache_method(
+    method: str,
+    traverse_args: Tuple[Tuple[str, InternalTraversal], ...],
+    args: Tuple[Any, ...],
+) -> _CacheEntryTag:
+    categories = _REFLECTION_METHOD_CATEGORIES.get(
+        method, ReflectionCategory.ALL
+    )
+    schema: Optional[str] = None
+    names: List[str] = []
+    list_seen = False
+
+    for (attrname, sym), arg in zip(traverse_args, args):
+        if attrname == "schema" and isinstance(arg, str):
+            schema = str(arg)
+        if sym is InternalTraversal.dp_string_list:
+            list_seen = True
+            if arg is None:
+                # an unfiltered batch loader covers the whole schema
+                return _CacheEntryTag(method, categories, schema, None)
+            else:
+                names.extend(str(name) for name in arg)
+
+    if names:
+        return _CacheEntryTag(method, categories, schema, frozenset(names))
+    elif list_seen:
+        # empty name filter; conservatively treated as whole-schema
+        return _CacheEntryTag(method, categories, schema, None)
+    else:
+        return _CacheEntryTag(method, categories, schema, None)
+
+
+# attribute names that may appear in the flat tuples built by flexi_cache;
+# used when entries are written outside of the decorators, e.g. by tests or
+# third party code putting pre-built keys directly into a ReflectionCache.
+_FLEXI_LIST_ATTRS = frozenset({"filter_names", "all_objects"})
+_FLEXI_SCALAR_ATTRS = frozenset(
+    {"schema", "filter_names", "all_objects", "kind", "scope", "dblink"}
+)
+
+
+def _tag_from_cache_key(key: Any) -> Optional[_CacheEntryTag]:
+    """Best-effort classification of a legacy tuple cache key.
+
+    Entries written through the :func:`cache` and :func:`flexi_cache`
+    decorators carry an explicit :class:`_CacheEntryTag`; this parser is only
+    used for entries placed directly in a cache mapping (e.g. plain dict
+    caches invalidated selectively, or third party writes).
+    """
+
+    if not isinstance(key, tuple) or not key:
+        return None
+    method = key[0]
+    if not isinstance(method, str):
+        return None
+    categories = _REFLECTION_METHOD_CATEGORIES.get(
+        method, ReflectionCategory.ALL
+    )
+
+    if (
+        len(key) == 3
+        and isinstance(key[1], tuple)
+        and isinstance(key[2], tuple)
+    ):
+        # @cache style key: (method, positional_str_args, kw_items)
+        name: Optional[str] = None
+        for part in key[1]:
+            name = _plain_cache_key_string(part)
+            if name is not None:
+                break
+
+        schema: Optional[str] = None
+        schema_present = False
+        for item in key[2]:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and item[0] == "schema"
+            ):
+                schema_present = True
+                schema = _plain_cache_key_string(item[1])
+
+        if name is not None:
+            return _CacheEntryTag(
+                method, categories, schema, frozenset({name})
+            )
+        elif schema_present:
+            return _CacheEntryTag(method, categories, schema, None)
+        else:
+            return _CacheEntryTag(method, categories, None, frozenset())
+
+    # flexi_cache style flat key:
+    # (method, attr, value, ..., list_member, ...)
+    schema = None
+    names: List[str] = []
+    i = 1
+    while i < len(key):
+        token = key[i]
+        if isinstance(token, str) and token in _FLEXI_SCALAR_ATTRS:
+            value = key[i + 1] if i + 1 < len(key) else None
+            if token == "schema":
+                schema = _plain_cache_key_string(value)
+            elif token in _FLEXI_LIST_ATTRS and value is None:
+                # unfiltered batch loader covers the whole schema
+                return _CacheEntryTag(method, categories, schema, None)
+            i += 2
+        else:
+            # non-None string lists are stored as bare members (the
+            # attribute name is omitted by the key builder)
+            name = _plain_cache_key_string(token)
+            if name is not None:
+                names.append(name)
+            i += 1
+
+    if names:
+        return _CacheEntryTag(method, categories, schema, frozenset(names))
+    return _CacheEntryTag(method, categories, schema, None)
+
+
+def _coerce_categories(
+    categories: Optional[
+        Union[
+            ReflectionCategory, str, Collection[Union[ReflectionCategory, str]]
+        ]
+    ],
+) -> ReflectionCategory:
+    if categories is None:
+        return ReflectionCategory.ALL
+    if isinstance(categories, ReflectionCategory):
+        return categories
+    if isinstance(categories, str):
+        categories = (categories,)
+
+    mask = ReflectionCategory(0)
+    for category in categories:
+        if isinstance(category, str):
+            category = ReflectionCategory[category.upper()]
+        mask |= category
+    return mask
+
+
+def _tag_matches_scope(
+    tag: _CacheEntryTag,
+    table_name: Optional[str],
+    schema_given: bool,
+    schema: Optional[str],
+    include_covering: bool,
+) -> bool:
+    if table_name is not None:
+        if tag.names is None:
+            # whole-schema entry that covers the requested table
+            return include_covering and tag.schema == schema
+        if not tag.names:
+            # global entries are not related to a single table
+            return False
+        return tag.schema == schema and table_name in tag.names
+    elif schema_given:
+        if tag.names is None:
+            return include_covering and tag.schema == schema
+        if not tag.names:
+            # global entries are not related to a single schema
+            return False
+        return tag.schema == schema
+    else:
+        return True
+
+
+def _store_cached_entry(
+    info_cache: Any,
+    key: Any,
+    value: Any,
+    tag: _CacheEntryTag,
+) -> None:
+    put_cached = getattr(info_cache, "put_cached", None)
+    if put_cached is not None:
+        put_cached(key, value, tag)
+    else:
+        # plain dict cache (the default): identical behavior to the
+        # previous direct assignment
+        info_cache[key] = value
+
+
+class CacheVersion:
+    """A monotonically increasing version stamp shared by one or more
+    :class:`.ReflectionCache` instances.
+
+    A version token can be passed to several :class:`.ReflectionCache`
+    objects so that they keep private entries but agree on which generation
+    of reflected data is current, e.g. across reconnects.  Calling
+    :meth:`.CacheVersion.bump` makes every entry stamped with an older
+    version be treated as a cache miss.
+
+    .. versionadded:: 2.1
+
+    """
+
+    def __init__(self, version: int = 1) -> None:
+        self._lock = threading.RLock()
+        self._version = version
+
+    @property
+    def version(self) -> int:
+        with self._lock:
+            return self._version
+
+    def bump(self) -> int:
+        """Advance the version, invalidating every older cache entry."""
+
+        with self._lock:
+            self._version += 1
+            return self._version
+
+
+@dataclass
+class _SchemaIndex:
+    # keys of whole-schema entries (listings, unfiltered batch loaders)
+    broad: Set[Any] = field(default_factory=set)
+    # table name -> keys of entries pertaining to that table
+    tables: Dict[str, Set[Any]] = field(default_factory=dict)
+
+
+class ReflectionCache(MutableMapping[Any, Any]):
+    """A shareable, versioned reflection cache for
+    :class:`_reflection.Inspector` instances.
+
+    A :class:`_reflection.Inspector` uses a private plain dict cache by
+    default; a :class:`.ReflectionCache` instance can be shared between
+    inspectors via the ``reflection_cache`` parameter of :func:`_sa.inspect`
+    so that reflected data is queried only once::
+
+        from sqlalchemy import inspect
+        from sqlalchemy.engine.reflection import ReflectionCache
+
+        cache = ReflectionCache()
+        insp1 = inspect(engine, reflection_cache=cache)
+        insp2 = inspect(engine, reflection_cache=cache)
+
+    The cache adds two capabilities over the private dict:
+
+    * :meth:`.ReflectionCache.invalidate` (also available as
+      :meth:`_reflection.Inspector.invalidate_cache`) selectively drops
+      entries by table and/or :class:`.ReflectionCategory`, leaving
+      unrelated entries in place; both single-table and multi-table
+      (batch) reflection entries are covered.
+    * each entry carries a version stamp. Calling
+      :meth:`.ReflectionCache.bump_version` (or
+      :meth:`.CacheVersion.bump` on a shared :class:`.CacheVersion`) makes
+      every older entry be treated as a miss, so a party that modifies the
+      schema can invalidate all sharing inspectors at once, including after
+      a reconnect.
+
+    All operations are guarded by a reentrant lock: a reader always
+    observes either the previous or the current entry for a given key,
+    never a partially invalidated state.
+
+    .. versionadded:: 2.1
+
+    """
+
+    def __init__(
+        self, *, version_token: Optional[CacheVersion] = None
+    ) -> None:
+        self._lock = threading.RLock()
+        self._version_token = (
+            version_token if version_token is not None else CacheVersion()
+        )
+        self._entries: Dict[Any, Tuple[Any, int]] = {}
+        self._tags: Dict[Any, _CacheEntryTag] = {}
+        self._schema_index: Dict[Optional[str], _SchemaIndex] = {}
+        self._global_keys: Set[Any] = set()
+
+    @property
+    def version(self) -> int:
+        """The current version stamp."""
+
+        return self._version_token.version
+
+    @property
+    def version_token(self) -> CacheVersion:
+        """The :class:`.CacheVersion` used by this cache."""
+
+        return self._version_token
+
+    def bump_version(self) -> None:
+        """Invalidate all entries stamped with an older version.
+
+        Entries are evicted lazily on access; inspectors sharing this cache
+        (or its :attr:`.ReflectionCache.version_token`) start using fresh
+        data on their next reflection call.
+
+        """
+
+        self._version_token.bump()
+
+    def _current_version(self) -> int:
+        return self._version_token.version
+
+    def _schema_index_for(self, schema: Optional[str]) -> _SchemaIndex:
+        si = self._schema_index.get(schema)
+        if si is None:
+            si = _SchemaIndex()
+            self._schema_index[schema] = si
+        return si
+
+    def _index_key(self, key: Any, tag: _CacheEntryTag) -> None:
+        if tag.names is None:
+            self._schema_index_for(tag.schema).broad.add(key)
+        elif tag.names:
+            si = self._schema_index_for(tag.schema)
+            for name in tag.names:
+                si.tables.setdefault(name, set()).add(key)
+        else:
+            self._global_keys.add(key)
+
+    def _unindex_key(self, key: Any, tag: _CacheEntryTag) -> None:
+        if tag.names is None:
+            si = self._schema_index.get(tag.schema)
+            if si is not None:
+                si.broad.discard(key)
+        elif tag.names:
+            si = self._schema_index.get(tag.schema)
+            if si is not None:
+                for name in tag.names:
+                    bucket = si.tables.get(name)
+                    if bucket is not None:
+                        bucket.discard(key)
+                        if not bucket:
+                            del si.tables[name]
+        else:
+            self._global_keys.discard(key)
+
+    def put_cached(self, key: Any, value: Any, tag: _CacheEntryTag) -> None:
+        """Store an entry together with its reflection tag."""
+
+        with self._lock:
+            old_tag = self._tags.get(key)
+            if old_tag is not None and old_tag != tag:
+                self._unindex_key(key, old_tag)
+                old_tag = None
+            self._entries[key] = (value, self._current_version())
+            self._tags[key] = tag
+            if old_tag is None:
+                self._index_key(key, tag)
+
+    def _lookup(self, key: Any) -> Tuple[bool, Any]:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return False, None
+            value, entry_version = entry
+            if entry_version != self._current_version():
+                # stale generation: evict and report a miss
+                tag = self._tags.pop(key, None)
+                del self._entries[key]
+                if tag is not None:
+                    self._unindex_key(key, tag)
+                return False, None
+            return True, value
+
+    def __getitem__(self, key: Any) -> Any:
+        found, value = self._lookup(key)
+        if not found:
+            raise KeyError(key)
+        return value
+
+    def get(self, key: Any, default: Optional[Any] = None) -> Any:
+        found, value = self._lookup(key)
+        return value if found else default
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        tag = _tag_from_cache_key(key)
+        if tag is None:
+            tag = _CacheEntryTag(
+                repr(type(key)), ReflectionCategory.ALL, None, frozenset()
+            )
+        self.put_cached(key, value, tag)
+
+    def __delitem__(self, key: Any) -> None:
+        with self._lock:
+            tag = self._tags.pop(key)
+            del self._entries[key]
+            self._unindex_key(key, tag)
+
+    def __iter__(self) -> Any:
+        with self._lock:
+            current = self._current_version()
+            return iter(
+                [
+                    key
+                    for key, (_, entry_version) in self._entries.items()
+                    if entry_version == current
+                ]
+            )
+
+    def __len__(self) -> int:
+        with self._lock:
+            current = self._current_version()
+            return sum(
+                1
+                for _, entry_version in self._entries.values()
+                if entry_version == current
+            )
+
+    def __contains__(self, key: Any) -> bool:
+        found, _ = self._lookup(key)
+        return found
+
+    def clear(self) -> None:
+        """Remove every entry, regardless of version or scope."""
+
+        with self._lock:
+            self._entries.clear()
+            self._tags.clear()
+            self._schema_index.clear()
+            self._global_keys.clear()
+
+    def invalidate(
+        self,
+        table_name: Optional[str] = None,
+        schema: Any = _UNSET,
+        *,
+        categories: Optional[
+            Union[
+                ReflectionCategory,
+                str,
+                Collection[Union[ReflectionCategory, str]],
+            ]
+        ] = None,
+        include_covering: bool = True,
+    ) -> int:
+        """Selectively invalidate cached reflection entries.
+
+        :param table_name: invalidate entries pertaining to this table,
+         view or sequence. When omitted but ``schema`` is given, all
+         per-table entries of that schema are considered.
+        :param schema: schema name; ``None`` means the default schema. When
+         omitted entirely, the invalidation is not scoped to a schema.
+        :param categories: optional :class:`.ReflectionCategory` (or a
+         combination of flags, or member name(s) as strings) to restrict
+         the invalidation. By default all categories are invalidated.
+        :param include_covering: when invalidating a table or schema, also
+         drop whole-schema entries (name listings and unfiltered batch
+         loaders) that cover the same schema. This is needed after
+         create/drop operations. Defaults to ``True``.
+
+        :return: the number of entries that were removed.
+
+        """
+
+        mask = _coerce_categories(categories)
+        schema_given = schema is not _UNSET
+        norm_schema: Optional[str] = None if not schema_given else schema
+
+        with self._lock:
+            if (
+                table_name is None
+                and not schema_given
+                and include_covering
+                and mask == ReflectionCategory.ALL
+            ):
+                count = len(self._entries)
+                self.clear()
+                return count
+
+            candidates: Set[Any] = set()
+            if table_name is not None:
+                si = self._schema_index.get(norm_schema)
+                if si is not None:
+                    candidates.update(si.tables.get(table_name, ()))
+                    if include_covering:
+                        candidates.update(si.broad)
+            elif schema_given:
+                si = self._schema_index.get(norm_schema)
+                if si is not None:
+                    for keys in si.tables.values():
+                        candidates.update(keys)
+                    if include_covering:
+                        candidates.update(si.broad)
+            else:
+                # category-only invalidation across every scope
+                candidates.update(self._tags.keys())
+
+            removed = 0
+            for key in candidates:
+                tag = self._tags.get(key)
+                if tag is None:
+                    continue
+                if not _tag_matches_scope(
+                    tag,
+                    table_name,
+                    schema_given,
+                    norm_schema,
+                    include_covering,
+                ):
+                    continue
+                if not bool(tag.categories & mask):
+                    continue
+                entry = self._entries.pop(key, None)
+                self._tags.pop(key, None)
+                if entry is not None:
+                    self._unindex_key(key, tag)
+                    removed += 1
+            return removed
+
+
+def _invalidate_legacy_cache(
+    info_cache: Any,
+    table_name: Optional[str] = None,
+    schema: Any = _UNSET,
+    *,
+    categories: Optional[
+        Union[
+            ReflectionCategory,
+            str,
+            Collection[Union[ReflectionCategory, str]],
+        ]
+    ] = None,
+    include_covering: bool = True,
+) -> int:
+    """Selectively invalidate a plain dict info_cache by parsing its keys.
+
+    This keeps selective invalidation available for inspectors that use
+    the default private dict cache; sharing and version stamps require a
+    :class:`.ReflectionCache`.
+    """
+
+    schema_given = schema is not _UNSET
+    norm_schema: Optional[str] = None if not schema_given else schema
+
+    if (
+        table_name is None
+        and not schema_given
+        and categories is None
+        and include_covering
+    ):
+        count = len(info_cache)
+        info_cache.clear()
+        return count
+
+    mask = _coerce_categories(categories)
+    removed = 0
+    for key in list(info_cache.keys()):
+        tag = _tag_from_cache_key(key)
+        if tag is None:
+            continue
+        if not _tag_matches_scope(
+            tag,
+            table_name,
+            schema_given,
+            norm_schema,
+            include_covering,
+        ):
+            continue
+        if not bool(tag.categories & mask):
+            continue
+        try:
+            del info_cache[key]
+        except KeyError:
+            continue
+        removed += 1
+    return removed
+
+
 @inspection._self_inspects
 class Inspector(inspection.Inspectable["Inspector"]):
     """Performs database schema inspection.
@@ -194,6 +951,8 @@ class Inspector(inspection.Inspectable["Inspector"]):
     Following DDL operations on the database, it is recommended to either
     create a new :class:`_reflection.Inspector` instance or to clear the cache
     of existing instances using the :meth:`.Inspector.clear_cache` method.
+    Cached entries may also be invalidated selectively, without dropping
+    unrelated entries, using :meth:`.Inspector.invalidate_cache`.
 
     A :class:`_reflection.Inspector` object is usually created via the
     :func:`_sa.inspect` function, which may be passed an
@@ -204,6 +963,16 @@ class Inspector(inspection.Inspectable["Inspector"]):
 
         engine = create_engine("...")
         insp = inspect(engine)
+
+    A shareable, versioned :class:`.ReflectionCache` may be passed via the
+    ``reflection_cache`` argument so that multiple inspectors reuse the same
+    reflected data, and so that the cache can be invalidated as a whole by
+    version bump after DDL or a reconnect::
+
+        from sqlalchemy.engine.reflection import ReflectionCache
+
+        cache = ReflectionCache()
+        insp = inspect(engine, reflection_cache=cache)
 
     Where above, the :class:`~sqlalchemy.engine.interfaces.Dialect` associated
     with the engine may opt to return an :class:`_reflection.Inspector`
@@ -216,7 +985,8 @@ class Inspector(inspection.Inspectable["Inspector"]):
     engine: Engine
     _op_context_requires_connect: bool
     dialect: Dialect
-    info_cache: Dict[Any, Any]
+    info_cache: MutableMapping[Any, Any]
+    reflection_cache: Optional[ReflectionCache]
 
     @util.deprecated(
         "1.4",
@@ -266,6 +1036,7 @@ class Inspector(inspection.Inspectable["Inspector"]):
         self._op_context_requires_connect = True
         self.dialect = self.engine.dialect
         self.info_cache = {}
+        self.reflection_cache = None
 
     def _init_connection(self, connection: Connection) -> None:
         self.bind = connection
@@ -273,17 +1044,117 @@ class Inspector(inspection.Inspectable["Inspector"]):
         self._op_context_requires_connect = False
         self.dialect = self.engine.dialect
         self.info_cache = {}
+        self.reflection_cache = None
+
+    def _set_reflection_cache(self, reflection_cache: ReflectionCache) -> None:
+        if not isinstance(reflection_cache, ReflectionCache):
+            raise exc.ArgumentError(
+                "reflection_cache must be a ReflectionCache instance; "
+                "got %r" % (reflection_cache,)
+            )
+        self.reflection_cache = reflection_cache
+        self.info_cache = reflection_cache
 
     def clear_cache(self) -> None:
         """Reset the cache for this :class:`.Inspector`.
 
         Inspection methods that have data cached will emit SQL queries
-        when next called to get new data.
+        when next called to get new data.  When a shared
+        :class:`.ReflectionCache` is in use, this clears the shared cache
+        for every inspector using it; use
+        :meth:`.Inspector.invalidate_cache` for selective invalidation.
 
         .. versionadded:: 2.0
 
+        .. seealso:: :meth:`.Inspector.invalidate_cache`
+
         """
         self.info_cache.clear()
+
+    def invalidate_cache(
+        self,
+        table_name: Optional[str] = None,
+        schema: Any = _UNSET,
+        *,
+        categories: Optional[
+            Union[
+                ReflectionCategory,
+                str,
+                Collection[Union[ReflectionCategory, str]],
+            ]
+        ] = None,
+        include_covering: bool = True,
+    ) -> int:
+        """Invalidate cached reflection entries selectively.
+
+        Unlike :meth:`.Inspector.clear_cache`, only the entries matching
+        the given table/schema and categories are removed; entries for
+        other tables remain cached.  Both the single-table reflection
+        methods (e.g. :meth:`.Inspector.get_columns`) and the multi-table
+        batch methods (e.g. :meth:`.Inspector.get_multi_columns`, along
+        with the dialect level batch loaders) are covered.
+
+        :param table_name: name of the table, view or sequence whose
+         entries are invalidated.
+        :param schema: schema name; ``None`` means the default schema.
+         When ``table_name`` is omitted and ``schema`` is given, all
+         entries of that schema are invalidated. When both are omitted,
+         the whole cache is cleared.
+        :param categories: optional :class:`.ReflectionCategory` (or a
+         combination of flags, or member name(s) as strings) to restrict
+         the invalidation, e.g. ``ReflectionCategory.COLUMNS``. By default
+         all categories for the target are invalidated.
+        :param include_covering: also invalidate whole-schema entries
+         (name listings and unfiltered batch data) covering the same
+         schema. This is required after create/drop operations and
+         defaults to ``True``; pass ``False`` to keep listings cached
+         when only the structure of an existing table changed.
+
+        :return: the number of cache entries removed.
+
+        .. versionadded:: 2.1
+
+        .. seealso:: :meth:`.Inspector.clear_cache`,
+           :meth:`.ReflectionCache.invalidate`
+
+        """
+
+        if self.reflection_cache is not None:
+            return self.reflection_cache.invalidate(
+                table_name,
+                schema,
+                categories=categories,
+                include_covering=include_covering,
+            )
+        else:
+            return _invalidate_legacy_cache(
+                self.info_cache,
+                table_name,
+                schema,
+                categories=categories,
+                include_covering=include_covering,
+            )
+
+    def bump_cache_version(self) -> None:
+        """Bump the reflection cache version, invalidating older entries.
+
+        When the inspector uses a shared :class:`.ReflectionCache` (or a
+        shared :class:`.CacheVersion`), all entries stamped with an older
+        version are treated as misses, in every inspector sharing the
+        version token. This is the recommended operation after the schema
+        was changed by another process or after a reconnect.
+
+        For an inspector with the default private dict cache, this is
+        equivalent to :meth:`.Inspector.clear_cache`.
+
+        .. versionadded:: 2.1
+
+        """
+
+        if self.reflection_cache is not None:
+            self.reflection_cache.bump_version()
+        else:
+            self.info_cache.clear()
 
     @classmethod
     @util.deprecated(
@@ -317,12 +1188,26 @@ class Inspector(inspection.Inspectable["Inspector"]):
         return cls._construct(cls._init_legacy, bind)
 
     @inspection._inspects(Engine)
-    def _engine_insp(bind: Engine) -> Inspector:  # type: ignore[misc]
-        return Inspector._construct(Inspector._init_engine, bind)
+    def _engine_insp(  # type: ignore[misc]
+        bind: Engine,
+        *,
+        reflection_cache: Optional[ReflectionCache] = None,
+    ) -> Inspector:
+        inspector = Inspector._construct(Inspector._init_engine, bind)
+        if reflection_cache is not None:
+            inspector._set_reflection_cache(reflection_cache)
+        return inspector
 
     @inspection._inspects(Connection)
-    def _connection_insp(bind: Connection) -> Inspector:  # type: ignore[misc]
-        return Inspector._construct(Inspector._init_connection, bind)
+    def _connection_insp(  # type: ignore[misc]
+        bind: Connection,
+        *,
+        reflection_cache: Optional[ReflectionCache] = None,
+    ) -> Inspector:
+        inspector = Inspector._construct(Inspector._init_connection, bind)
+        if reflection_cache is not None:
+            inspector._set_reflection_cache(reflection_cache)
+        return inspector
 
     @contextlib.contextmanager
     def _operation_context(self) -> Generator[Connection, None, None]:
@@ -356,6 +1241,7 @@ class Inspector(inspection.Inspectable["Inspector"]):
         with self._operation_context() as conn:
             sub_insp = self._construct(self.__class__._init_connection, conn)
             sub_insp.info_cache = self.info_cache
+            sub_insp.reflection_cache = self.reflection_cache
             yield sub_insp
 
     @property

@@ -89,29 +89,37 @@ class _InspectableProtocol(Protocol[_TCov]):
 
 @overload
 def inspect(
-    subject: Type[_InspectableTypeProtocol[_IN]], raiseerr: bool = True
+    subject: Type[_InspectableTypeProtocol[_IN]],
+    raiseerr: bool = True,
+    **kwargs: Any,
 ) -> _IN: ...
 
 
 @overload
 def inspect(
-    subject: _InspectableProtocol[_IN], raiseerr: bool = True
+    subject: _InspectableProtocol[_IN],
+    raiseerr: bool = True,
+    **kwargs: Any,
 ) -> _IN: ...
 
 
 @overload
-def inspect(subject: Inspectable[_IN], raiseerr: bool = True) -> _IN: ...
+def inspect(
+    subject: Inspectable[_IN], raiseerr: bool = True, **kwargs: Any
+) -> _IN: ...
 
 
 @overload
-def inspect(subject: Any, raiseerr: Literal[False] = ...) -> Optional[Any]: ...
+def inspect(
+    subject: Any, raiseerr: Literal[False] = ..., **kwargs: Any
+) -> Optional[Any]: ...
 
 
 @overload
-def inspect(subject: Any, raiseerr: bool = True) -> Any: ...
+def inspect(subject: Any, raiseerr: bool = True, **kwargs: Any) -> Any: ...
 
 
-def inspect(subject: Any, raiseerr: bool = True) -> Any:
+def inspect(subject: Any, raiseerr: bool = True, **kwargs: Any) -> Any:
     """Produce an inspection object for the given target.
 
     The returned value in some cases may be the
@@ -128,6 +136,10 @@ def inspect(subject: Any, raiseerr: bool = True) -> Any:
      correspond to a known SQLAlchemy inspected type,
      :class:`sqlalchemy.exc.NoInspectionAvailable`
      is raised.  If ``False``, ``None`` is returned.
+    :param \\**kwargs: additional keyword arguments forwarded to the
+     inspection constructor for the given subject, e.g.
+     ``reflection_cache`` when inspecting an :class:`_engine.Engine` or
+     :class:`_engine.Connection`.
 
     """
     type_ = type(subject)
@@ -138,7 +150,7 @@ def inspect(subject: Any, raiseerr: bool = True) -> Any:
                 continue
             elif reg is True:
                 return subject
-            ret = reg(subject)
+            ret = reg(subject, **kwargs) if kwargs else reg(subject)
             if ret is not None:
                 return ret
     else:

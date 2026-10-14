@@ -1,9 +1,12 @@
+import contextlib
 import itertools
+import threading
 import unicodedata
 
 import sqlalchemy as sa
 from sqlalchemy import Computed
 from sqlalchemy import Connection
+from sqlalchemy import create_engine
 from sqlalchemy import DefaultClause
 from sqlalchemy import event
 from sqlalchemy import FetchedValue
@@ -13,15 +16,26 @@ from sqlalchemy import Index
 from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import MetaData
+from sqlalchemy import pool
 from sqlalchemy import schema
 from sqlalchemy import select
 from sqlalchemy import sql
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.engine import CacheVersion
 from sqlalchemy.engine import Inspector
+from sqlalchemy.engine import ObjectKind
+from sqlalchemy.engine import ObjectScope
+from sqlalchemy.engine import ReflectionCache
+from sqlalchemy.engine import ReflectionCategory
+from sqlalchemy.engine.reflection import _CacheEntryTag
+from sqlalchemy.engine.reflection import _invalidate_legacy_cache
 from sqlalchemy.engine.reflection import cache
+from sqlalchemy.engine.reflection import flexi_cache
 from sqlalchemy.sql.elements import quoted_name
+from sqlalchemy.sql.visitors import InternalTraversal
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
@@ -2790,3 +2804,594 @@ class ReflectionCacheTest(fixtures.TestBase):
         eq_(cache_(name="n1"), 10)
         eq_(cache_("n2"), 11)
         eq_(cache_(name="n2"), 12)
+
+
+@contextlib.contextmanager
+def _count_reflection_statements(engine):
+    """Record SQL statements issued while reflecting (cache misses).
+
+    Statement counting happens below the reflection cache decorators, so
+    only statements that actually reached the DBAPI are captured.
+    """
+
+    statements = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+
+
+def _pragma_count(statements, pragma, name):
+    # sqlite emits e.g. PRAGMA main.table_xinfo("t1")
+    needles = ("%s(%s)" % (pragma, name), '%s("%s")' % (pragma, name))
+    return [s for s in statements if any(n in s for n in needles)]
+
+
+class ReflectionCacheTestBase:
+    def _setup_engine(self):
+        engine = create_engine(
+            "sqlite:///:memory:",
+            poolclass=pool.StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE t1 (id INTEGER PRIMARY KEY)"))
+            conn.execute(
+                text(
+                    "CREATE TABLE t2 (id INTEGER PRIMARY KEY, "
+                    "t1_id INTEGER REFERENCES t1 (id))"
+                )
+            )
+        return engine
+
+
+class ReflectionCacheManagementTest(
+    fixtures.TestBase, ReflectionCacheTestBase
+):
+    def test_default_cache_is_plain_dict(self):
+        engine = self._setup_engine()
+        insp = inspect(engine)
+        is_instance_of(insp.info_cache, dict)
+        is_(insp.reflection_cache, None)
+
+        # two inspectors do not share their private dict caches
+        insp2 = inspect(engine)
+        is_not(insp.info_cache, insp2.info_cache)
+        engine.dispose()
+
+    def test_inspect_with_reflection_cache_engine_and_connection(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        with engine.connect() as conn:
+            for subject in (engine, conn):
+                insp = inspect(subject, reflection_cache=shared)
+                is_(insp.reflection_cache, shared)
+                is_(insp.info_cache, shared)
+        engine.dispose()
+
+    def test_inspect_with_bad_reflection_cache(self):
+        engine = self._setup_engine()
+        with expect_raises_message(
+            sa.exc.ArgumentError,
+            "reflection_cache must be a ReflectionCache instance",
+        ):
+            inspect(engine, reflection_cache={})
+        engine.dispose()
+
+    def test_shared_cache_single_query(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        i1 = inspect(engine, reflection_cache=shared)
+        i2 = inspect(engine, reflection_cache=shared)
+        i1.get_columns("t1")
+        with _count_reflection_statements(engine) as statements:
+            # second inspector reuses the shared entry
+            i2.get_columns("t1")
+            eq_(_pragma_count(statements, "table_xinfo", "t1"), [])
+        engine.dispose()
+
+    def test_invalidate_single_table_keeps_others(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_columns("t1")
+        insp.get_columns("t2")
+        removed = insp.invalidate_cache("t1")
+        is_true(removed >= 1)
+        with _count_reflection_statements(engine) as statements:
+            insp.get_columns("t2")
+            eq_(_pragma_count(statements, "table_xinfo", "t2"), [])
+            insp.get_columns("t1")
+            eq_(len(_pragma_count(statements, "table_xinfo", "t1")), 1)
+        # t2 entry was never removed
+        is_true(("get_columns", ("t2",), (("schema", None),)) in shared)
+        engine.dispose()
+
+    def test_legacy_dict_invalidate_single_table(self):
+        engine = self._setup_engine()
+        insp = inspect(engine)
+        insp.get_columns("t1")
+        insp.get_columns("t2")
+        removed = insp.invalidate_cache("t1")
+        is_true(removed >= 1)
+        with _count_reflection_statements(engine) as statements:
+            insp.get_columns("t2")
+            eq_(_pragma_count(statements, "table_xinfo", "t2"), [])
+            insp.get_columns("t1")
+            eq_(len(_pragma_count(statements, "table_xinfo", "t1")), 1)
+        engine.dispose()
+
+    def test_invalidate_category(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_columns("t1")
+        insp.get_indexes("t1")
+        insp.invalidate_cache("t1", categories=ReflectionCategory.INDEXES)
+        # only the indexes entry was removed
+        is_true(("get_columns", ("t1",), (("schema", None),)) in shared)
+        is_false(("get_indexes", ("t1",), (("schema", None),)) in shared)
+        with _count_reflection_statements(engine) as statements:
+            insp.get_columns("t1")
+            insp.get_indexes("t1")
+            eq_(_pragma_count(statements, "table_xinfo", "t1"), [])
+            # sqlite probes main and temp for a table without indexes
+            is_true(len(_pragma_count(statements, "index_list", "t1")) >= 1)
+        engine.dispose()
+
+    def test_invalidate_category_as_string_and_combination(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_columns("t1")
+        insp.get_indexes("t1")
+        insp.get_pk_constraint("t1")
+        insp.invalidate_cache(
+            "t1",
+            categories=[
+                "columns",
+                ReflectionCategory.INDEXES,
+            ],
+        )
+        is_false(("get_columns", ("t1",), (("schema", None),)) in shared)
+        is_false(("get_indexes", ("t1",), (("schema", None),)) in shared)
+        is_true(("get_pk_constraint", ("t1",), (("schema", None),)) in shared)
+        engine.dispose()
+
+    def test_invalidate_covering_listings(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_table_names()
+        listing_key = (
+            "get_table_names",
+            (),
+            (("schema", None), ("sqlite_include_internal", False)),
+        )
+        is_true(listing_key in shared)
+
+        # default: invalidating a table also drops covering schema listings
+        insp.invalidate_cache("t1")
+        is_false(listing_key in shared)
+
+        # again but keep the listing cached
+        insp.get_table_names()
+        insp.invalidate_cache("t1", include_covering=False)
+        is_true(listing_key in shared)
+        engine.dispose()
+
+    def test_invalidate_schema_scoped(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_columns("t1")
+        insp.get_columns("t2")
+        insp.get_schema_names()
+        removed = insp.invalidate_cache(schema=None)
+        is_true(removed >= 2)
+        is_false(("get_columns", ("t1",), (("schema", None),)) in shared)
+        is_false(("get_columns", ("t2",), (("schema", None),)) in shared)
+        # global entry (schema names list) is outside of the schema scope
+        is_true(("get_schema_names", (), ()) in shared)
+        engine.dispose()
+
+    def test_version_bump_invalidates_shared_entries(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        i1 = inspect(engine, reflection_cache=shared)
+        i2 = inspect(engine, reflection_cache=shared)
+        i1.get_columns("t1")
+        eq_(shared.version, 1)
+        with _count_reflection_statements(engine) as statements:
+            i2.get_columns("t1")
+            eq_(_pragma_count(statements, "table_xinfo", "t1"), [])
+            shared.bump_version()
+            eq_(shared.version, 2)
+            # stale entry is a miss; the first sharing inspector that
+            # refreshes repopulates it for the others
+            i2.get_columns("t1")
+            i1.get_columns("t1")
+            eq_(len(_pragma_count(statements, "table_xinfo", "t1")), 1)
+        # the fresh entry is cached again
+        with _count_reflection_statements(engine) as statements:
+            i2.get_columns("t1")
+            eq_(_pragma_count(statements, "table_xinfo", "t1"), [])
+        engine.dispose()
+
+    def test_shared_version_token(self):
+        engine = self._setup_engine()
+        token = CacheVersion()
+        ca = ReflectionCache(version_token=token)
+        cb = ReflectionCache(version_token=token)
+        ia = inspect(engine, reflection_cache=ca)
+        ib = inspect(engine, reflection_cache=cb)
+        ia.get_columns("t1")
+        ib.get_columns("t1")
+        # private entries, but a shared generation token
+        token.bump()
+        with _count_reflection_statements(engine) as statements:
+            ia.get_columns("t1")
+            ib.get_columns("t1")
+            eq_(len(_pragma_count(statements, "table_xinfo", "t1")), 2)
+        engine.dispose()
+
+    def test_bump_cache_version_legacy_clears(self):
+        engine = self._setup_engine()
+        insp = inspect(engine)
+        insp.get_columns("t1")
+        is_true(insp.info_cache)
+        insp.bump_cache_version()
+        eq_(insp.info_cache, {})
+        engine.dispose()
+
+    def test_clear_cache_still_available(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        i1 = inspect(engine, reflection_cache=shared)
+        i2 = inspect(engine, reflection_cache=shared)
+        i1.get_columns("t1")
+        is_true(len(shared) >= 1)
+        i2.clear_cache()
+        eq_(len(shared), 0)
+        is_false(("get_columns", ("t1",), (("schema", None),)) in shared)
+        engine.dispose()
+
+    def test_multi_methods_share_invalidation(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        insp.get_multi_columns(filter_names=["t1", "t2"])
+        insp.invalidate_cache("t1", include_covering=False)
+        with _count_reflection_statements(engine) as statements:
+            insp.get_multi_columns(filter_names=["t1", "t2"])
+            # only the invalidated table is re-reflected
+            eq_(len(_pragma_count(statements, "table_xinfo", "t1")), 1)
+            eq_(_pragma_count(statements, "table_xinfo", "t2"), [])
+
+        # unfiltered batch key built internally by native multi dialects
+        # must also be invalidated when covering a changed table
+        key = ("batch",)
+        shared.put_cached(
+            key,
+            [("t1", []), ("t2", [])],
+            _CacheEntryTag(
+                "batch",
+                ReflectionCategory.COLUMNS,
+                None,
+                frozenset(("t1", "t2")),
+            ),
+        )
+        insp.invalidate_cache("t2", include_covering=False)
+        is_false(key in shared)
+        engine.dispose()
+
+    def test_fresh_columns_after_ddl_and_invalidation(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        eq_([c["name"] for c in insp.get_columns("t1")], ["id"])
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE t1 ADD COLUMN extra VARCHAR(10)"))
+        # still cached and stale ...
+        eq_([c["name"] for c in insp.get_columns("t1")], ["id"])
+        # ... until selective invalidation
+        insp.invalidate_cache(
+            "t1", categories="columns", include_covering=False
+        )
+        eq_([c["name"] for c in insp.get_columns("t1")], ["id", "extra"])
+        # unrelated table untouched
+        eq_([c["name"] for c in insp.get_columns("t2")], ["id", "t1_id"])
+        engine.dispose()
+
+    def test_inspection_context_shares_cache(self):
+        engine = self._setup_engine()
+        shared = ReflectionCache()
+        insp = inspect(engine, reflection_cache=shared)
+        with insp._inspection_context() as sub:
+            is_(sub.info_cache, shared)
+            is_(sub.reflection_cache, shared)
+        engine.dispose()
+
+
+class ReflectionCacheUnitTest(fixtures.TestBase):
+    def _tag(self, cache, key):
+        return cache._tags[key]
+
+    def test_version_default_and_bump(self):
+        cache = ReflectionCache()
+        eq_(cache.version, 1)
+        cache.bump_version()
+        eq_(cache.version, 2)
+
+    def test_entry_stamped_and_lazily_evicted(self):
+        cache = ReflectionCache()
+        tag = _CacheEntryTag(
+            "get_columns",
+            ReflectionCategory.COLUMNS,
+            None,
+            frozenset(("t1",)),
+        )
+        cache.put_cached("k", "v1", tag)
+        eq_(cache.get("k"), "v1")
+        cache.bump_version()
+        is_(cache.get("k"), None)
+        # lazily evicted
+        is_false("k" in cache)
+        is_false("k" in cache._tags)
+
+    def test_invalidate_table_does_not_touch_other_tables(self):
+        cache = ReflectionCache()
+
+        def mk(name):
+            return _CacheEntryTag(
+                "get_columns",
+                ReflectionCategory.COLUMNS,
+                None,
+                frozenset((name,)),
+            )
+
+        cache.put_cached("k1", 1, mk("t1"))
+        cache.put_cached("k2", 2, mk("t2"))
+        removed = cache.invalidate("t1")
+        eq_(removed, 1)
+        is_false("k1" in cache)
+        eq_(cache.get("k2"), 2)
+
+    def test_invalidate_whole_schema_broad_entry(self):
+        cache = ReflectionCache()
+
+        cache.put_cached(
+            "listing",
+            ["t1"],
+            _CacheEntryTag(
+                "get_table_names",
+                ReflectionCategory.LISTING,
+                None,
+                None,
+            ),
+        )
+        cache.put_cached(
+            "other_schema",
+            ["x"],
+            _CacheEntryTag(
+                "get_table_names",
+                ReflectionCategory.LISTING,
+                "s",
+                None,
+            ),
+        )
+        cache.invalidate("t1")
+        is_false("listing" in cache)
+        eq_(cache.get("other_schema"), ["x"])
+
+    def test_global_entries_not_invalidated_per_table(self):
+        cache = ReflectionCache()
+
+        cache.put_cached(
+            "global",
+            ["s1"],
+            _CacheEntryTag(
+                "get_schema_names",
+                ReflectionCategory.LISTING,
+                None,
+                frozenset(),
+            ),
+        )
+        cache.invalidate("anything")
+        eq_(cache.get("global"), ["s1"])
+        # full invalidation removes global entries too
+        cache.invalidate()
+        is_(cache.get("global"), None)
+
+    def test_category_only_invalidation(self):
+        cache = ReflectionCache()
+
+        cache.put_cached(
+            "cols",
+            1,
+            _CacheEntryTag(
+                "get_columns",
+                ReflectionCategory.COLUMNS,
+                None,
+                frozenset(("t1",)),
+            ),
+        )
+        cache.put_cached(
+            "idx",
+            2,
+            _CacheEntryTag(
+                "get_indexes",
+                ReflectionCategory.INDEXES,
+                None,
+                frozenset(("t1",)),
+            ),
+        )
+        cache.invalidate(categories=ReflectionCategory.INDEXES)
+        eq_(cache.get("cols"), 1)
+        is_(cache.get("idx"), None)
+
+    def test_tuple_key_mapping_protocol(self):
+        cache = ReflectionCache()
+        # plain dict-style puts are classified from the legacy tuple key
+        cache[("get_columns", ("t1",), (("schema", None),))] = ["c"]
+        cache[
+            (
+                "_get_table_oids",
+                "schema",
+                None,
+                "t1",
+                "t2",
+                "kind",
+                ReflectionCategory.COLUMNS,
+                "scope",
+                None,
+            )
+        ] = [1, 2]
+        eq_(len(cache), 2)
+        is_true(("get_columns", ("t1",), (("schema", None),)) in cache)
+        cache.invalidate("t1", include_covering=False)
+        eq_(len(cache), 0)
+
+    def test_flexi_cache_decorator_tags(self, connection):
+        dialect = connection.dialect
+        shared = ReflectionCache()
+        counter = itertools.count(1)
+
+        @flexi_cache(
+            ("schema", InternalTraversal.dp_string),
+            ("filter_names", InternalTraversal.dp_string_list),
+            ("kind", InternalTraversal.dp_plain_obj),
+            ("scope", InternalTraversal.dp_plain_obj),
+        )
+        def batch(self, connection, schema, filter_names, kind, scope, **kw):
+            return next(counter)
+
+        def call_batch(filter_names):
+            return batch(
+                dialect,
+                connection,
+                None,
+                filter_names,
+                ObjectKind.ANY,
+                ObjectScope.ANY,
+                info_cache=shared,
+            )
+
+        eq_(call_batch(("t1", "t2")), 1)
+        eq_(call_batch(("t1", "t2")), 1)
+        key = list(shared.keys())[0]
+        tag = self._tag(shared, key)
+        eq_(tag.method, "batch")
+        eq_(tag.names, frozenset(("t1", "t2")))
+        # invalidating one table of a shared batch entry drops it
+        shared.invalidate("t1", include_covering=False)
+        eq_(len(shared), 0)
+        eq_(call_batch(("t1", "t2")), 2)
+
+        # unfiltered batch is whole-schema: invalidating an unrelated
+        # table keeps it when covering entries are excluded
+        eq_(call_batch(None), 3)
+        shared.invalidate("t9", include_covering=False)
+        eq_(len(shared), 2)
+        # with covering entries included, the whole-schema entry goes
+        shared.invalidate("t9")
+        eq_(len(shared), 1)
+
+    def test_concurrent_invalidation_never_tears_entries(self):
+        cache = ReflectionCache()
+
+        tag_t1 = _CacheEntryTag(
+            "get_columns",
+            ReflectionCategory.COLUMNS,
+            None,
+            frozenset(("t1",)),
+        )
+        tag_t2 = _CacheEntryTag(
+            "get_columns",
+            ReflectionCategory.COLUMNS,
+            None,
+            frozenset(("t2",)),
+        )
+        cache.put_cached("k1", tuple(range(100)), tag_t1)
+        cache.put_cached("k2", tuple(range(100, 200)), tag_t2)
+
+        errors = []
+        stop = threading.Event()
+
+        def is_complete(value):
+            # every observable value must be one whole, contiguous tuple
+            # (old generation or new generation), never a partial entry
+            return (
+                isinstance(value, tuple)
+                and len(value) == 100
+                and value[-1] == value[0] + 99
+            )
+
+        def reader():
+            while not stop.is_set():
+                for key in ("k1", "k2"):
+                    value = cache.get(key)
+                    if value is not None and not is_complete(value):
+                        errors.append(("torn", key, value))
+
+        def writer_invalidator():
+            generation = 0
+            while not stop.is_set():
+                generation += 1
+                value = tuple(range(generation, generation + 100))
+                cache.put_cached("k1", value, tag_t1)
+                cache.invalidate("t1", include_covering=False)
+                cache.put_cached("k1", value, tag_t1)
+                if generation % 7 == 0:
+                    cache.bump_version()
+                    cache.put_cached("k1", tuple(range(100)), tag_t1)
+                    cache.put_cached("k2", tuple(range(100, 200)), tag_t2)
+
+        threads = [threading.Thread(target=reader) for _ in range(6)]
+        threads.append(threading.Thread(target=writer_invalidator))
+        for t in threads:
+            t.start()
+        stop.wait(1.0)
+        stop.set()
+        for t in threads:
+            t.join()
+
+        eq_(errors, [])
+        # internal indexes stay consistent
+        for key, tag in list(cache._tags.items()):
+            is_true(key in cache._entries)
+        eq_(
+            len(cache._entries),
+            len(cache._tags),
+        )
+
+    def test_legacy_cache_dict_helper(self):
+        info_cache = {
+            ("get_columns", ("t1",), (("schema", None),)): ["a"],
+            ("get_columns", ("t2",), (("schema", None),)): ["b"],
+            ("get_indexes", ("t1",), (("schema", None),)): [],
+            ("get_table_names", (), (("schema", None),)): ["t1", "t2"],
+            ("get_schema_names", (), ()): ["main"],
+        }
+        removed = _invalidate_legacy_cache(
+            info_cache, "t1", categories=ReflectionCategory.COLUMNS
+        )
+        eq_(removed, 1)
+        is_false(("get_columns", ("t1",), (("schema", None),)) in info_cache)
+        is_true(("get_indexes", ("t1",), (("schema", None),)) in info_cache)
+
+        removed = _invalidate_legacy_cache(info_cache, "t2")
+        is_true(removed >= 2)  # t2 columns + covering table names list
+        is_false(("get_columns", ("t2",), (("schema", None),)) in info_cache)
+        is_false(("get_table_names", (), (("schema", None),)) in info_cache)
+        # global entry survives table/schema scoped invalidation
+        is_true(("get_schema_names", (), ()) in info_cache)
+
+        removed = _invalidate_legacy_cache(info_cache)
+        eq_(removed, 2)  # indexes t1 + schema names
+        eq_(info_cache, {})

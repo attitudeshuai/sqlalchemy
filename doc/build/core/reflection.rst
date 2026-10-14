@@ -366,6 +366,59 @@ database is also available. This is known as the "Inspector"::
     :members:
     :undoc-members:
 
+.. _reflection_cache:
+
+Reflection Cache Sharing and Selective Invalidation
+-----------------------------------------------------
+
+By default, each :class:`_reflection.Inspector` keeps a private cache of
+the reflected data it has fetched; :meth:`_reflection.Inspector.clear_cache`
+drops all of it.  When the same schema is inspected repeatedly, or from
+several inspectors (for example before and after a reconnect), a
+:class:`.ReflectionCache` can be shared between inspectors using the
+``reflection_cache`` argument of :func:`_sa.inspect`::
+
+    from sqlalchemy import inspect
+    from sqlalchemy.engine.reflection import ReflectionCache
+
+    reflection_cache = ReflectionCache()
+
+    inspector_1 = inspect(engine, reflection_cache=reflection_cache)
+    inspector_2 = inspect(engine, reflection_cache=reflection_cache)
+
+A shared cache is invalidated selectively after DDL without re-reflecting
+unrelated tables, using
+:meth:`_reflection.Inspector.invalidate_cache`::
+
+    # refresh only the columns of one table
+    inspector_1.invalidate_cache(
+        "some_table", categories=ReflectionCategory.COLUMNS
+    )
+
+    # refresh every cached category of one table, including listings
+    inspector_1.invalidate_cache("some_table")
+
+A version stamp may be bumped instead, which makes every entry produced by
+an older generation be treated as a miss, in all inspectors sharing the
+cache or a common :class:`.CacheVersion`::
+
+    # e.g. after the schema was changed by another process, or a reconnect
+    reflection_cache.bump_version()
+
+.. autoclass:: sqlalchemy.engine.reflection.ReflectionCache
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlalchemy.engine.reflection.ReflectionCategory
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlalchemy.engine.reflection.CacheVersion
+    :members:
+    :undoc-members:
+
+.. versionadded:: 2.1
+
 .. autoclass:: sqlalchemy.engine.interfaces.ReflectedColumn
     :members:
     :inherited-members: dict

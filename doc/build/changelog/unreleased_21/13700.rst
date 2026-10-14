@@ -1,0 +1,20 @@
+.. change::
+    :tags: feature, engine
+    :tickets: 13700
+
+    Added :class:`.ReflectionCache`, a shareable, versioned cache for
+    :class:`_reflection.Inspector` results. The cache can be passed to
+    :func:`_sa.inspect` via the new ``reflection_cache`` keyword argument so
+    that multiple inspectors reuse the same reflected data. The new
+    :meth:`_reflection.Inspector.invalidate_cache` method (also available as
+    :meth:`.ReflectionCache.invalidate`) selectively invalidates cached
+    entries by table and :class:`.ReflectionCategory`, covering both the
+    single-table and multi-table (batch) reflection methods, while leaving
+    unrelated entries cached; :meth:`.ReflectionCache.bump_version` and the
+    new :class:`.CacheVersion` allow schema changes (including across a
+    reconnect) to invalidate older entries in every sharing inspector. All
+    cache operations are synchronized so that readers observe either the
+    previous or the current entry, never a partially invalidated state.
+    Inspectors that do not use a :class:`.ReflectionCache` retain their
+    previous private-dict caching behavior, including
+    :meth:`_reflection.Inspector.clear_cache`.
